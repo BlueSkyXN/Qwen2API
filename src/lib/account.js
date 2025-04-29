@@ -44,7 +44,11 @@ class Account {
       "qwen2.5-72b-instruct",
       "qwen2.5-coder-32b-instruct",
       "qwen2.5-14b-instruct-1m",
-      "qwen2.5-vl-32b-instruct"
+      "qwen2.5-vl-32b-instruct",
+      // 新增的Qwen3系列模型
+      "qwen3-235b-a22b",
+      "qwen3-30b-a3b",
+      "qwen3-32b"
     ]
 
     this.defaultHeaders = {
