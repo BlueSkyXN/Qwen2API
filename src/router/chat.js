@@ -122,11 +122,15 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
       let webSearchInfo = null
       let temp_content = ''
       let thinkEnd = false
-
+      
+      // 新增变量，用于处理phase标记的思考过程
+      let previousPhase = null
+      let isInThinkingPhase = false
+      
       response.on('start', () => {
         setResHeader(true)
       })
-
+  
       response.on('data', async (chunk) => {
         const decodeText = decoder.decode(chunk, { stream: true })
         // console.log(decodeText)
@@ -142,28 +146,59 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
               }
               temp_content = ''
             }
-
+  
             // 处理 web_search 信息
             if (decodeJson.choices[0].delta.name === 'web_search') {
               webSearchInfo = decodeJson.choices[0].delta.extra.web_search_info
             }
-
+  
             // 处理内容
-            let content = decodeJson.choices[0].delta.content
-
+            let content = decodeJson.choices[0].delta.content || ''
+            
+            // 处理phase标记的思考过程 (针对Qwen3系列模型)
+            if (decodeJson.choices[0].delta.phase) {
+              const currentPhase = decodeJson.choices[0].delta.phase
+              
+              // 检测阶段转换
+              if (previousPhase !== currentPhase) {
+                // 从无到think - 添加开始标签
+                if (currentPhase === 'think' && !isInThinkingPhase) {
+                  content = '<think>' + content
+                  isInThinkingPhase = true
+                } 
+                // 从think到answer - 添加结束标签
+                else if (previousPhase === 'think' && currentPhase === 'answer' && isInThinkingPhase) {
+                  content = '</think>' + content
+                  isInThinkingPhase = false
+                }
+                
+                previousPhase = currentPhase
+              }
+            }
+  
             if (backContent !== null) {
               content = content.replace(backContent, '')
             }
-
-            backContent = decodeJson.choices[0].delta.content
-
-            if (thinkingEnabled && process.env.OUTPUT_THINK === "false" && !thinkEnd && !backContent.includes("</think>")) {
-              continue
-            } else if (thinkingEnabled && process.env.OUTPUT_THINK === "false" && !thinkEnd && backContent.includes("</think>")) {
-              content = content.replace("</think>", "")
-              thinkEnd = true
+  
+            backContent = decodeJson.choices[0].delta.content || ''
+  
+            // 处理思考内容的显示/隐藏逻辑
+            if (thinkingEnabled && process.env.OUTPUT_THINK === "false") {
+              // 针对老模型和新转换的phase模型，都能处理<think>标签
+              if (!thinkEnd) {
+                // 如果内容中包含</think>，说明思考结束
+                if (content.includes("</think>")) {
+                  content = content.replace("</think>", "")
+                  thinkEnd = true
+                } 
+                // 如果思考还未结束，且没有</think>标签，跳过输出
+                else if (!content.includes("</think>")) {
+                  continue
+                }
+              }
             }
-
+  
+            // 处理搜索信息
             if (webSearchInfo && process.env.OUTPUT_THINK === "true") {
               if (thinkingEnabled && content.includes("<think>")) {
                 content = content.replace("<think>", `<think>\n\n\n${await accountManager.generateMarkdownTable(webSearchInfo, process.env.SEARCH_INFO_MODE || "table")}\n\n\n`)
@@ -174,55 +209,30 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
               }
             }
             // console.log(content)
-
-            const StreamTemplate = {
-              "id": `chatcmpl-${id}`,
-              "object": "chat.completion.chunk",
-              "created": new Date().getTime(),
-              "choices": [
-                {
-                  "index": 0,
-                  "delta": {
-                    "content": content
-                  },
-                  "finish_reason": null
-                }
-              ]
+            // 确保有内容才发送
+            if (content) {
+              const StreamTemplate = {
+                "id": `chatcmpl-${id}`,
+                "object": "chat.completion.chunk",
+                "created": new Date().getTime(),
+                "choices": [
+                  {
+                    "index": 0,
+                    "delta": {
+                      "content": content
+                    },
+                    "finish_reason": null
+                  }
+                ]
+              }
+              res.write(`data: ${JSON.stringify(StreamTemplate)}\n\n`)
             }
-            res.write(`data: ${JSON.stringify(StreamTemplate)}\n\n`)
           } catch (error) {
             console.log(error)
             res.status(500).json({ error: "服务错误!!!" })
           }
         }
       })
-
-      response.on('end', async () => {
-        if (process.env.OUTPUT_THINK === "false" && webSearchInfo) {
-          const webSearchTable = await accountManager.generateMarkdownTable(webSearchInfo, process.env.SEARCH_INFO_MODE || "table")
-          res.write(`data: ${JSON.stringify({
-            "id": `chatcmpl-${id}`,
-            "object": "chat.completion.chunk",
-            "created": new Date().getTime(),
-            "choices": [
-              {
-                "index": 0,
-                "delta": {
-                  "content": `\n\n\n${webSearchTable}`
-                }
-              }
-            ]
-          })}\n\n`)
-        }
-        res.write(`data: [DONE]\n\n`)
-        res.end()
-      })
-    } catch (error) {
-      console.log(error)
-      res.status(500).json({ error: "服务错误!!!" })
-    }
-  }
-
   try {
     let response_data = null
     if (req.body.model.includes('-draw')) {
