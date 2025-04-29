@@ -237,7 +237,7 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
       // 用于处理phase标记的思考过程
       let previousPhase = null
       let isInThinkingPhase = false
-      let hasFinishedThinking = false  // 新增：标记思考是否已结束
+      let hasFinishedThinking = false  // 标记思考是否已结束
       
       response.on('start', () => {
         setResHeader(true)
@@ -245,7 +245,9 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
 
       response.on('data', async (chunk) => {
         const decodeText = decoder.decode(chunk, { stream: true })
-        // 调试用：console.log('原始SSE块:', decodeText)
+        // 打印原始SSE数据用于调试
+        console.log('原始SSE块:', decodeText)
+        
         const lists = decodeText.split('\n').filter(item => item.trim() !== '')
         for (const item of lists) {
           try {
@@ -271,14 +273,13 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
             // 处理内容
             let content = decodeJson.choices[0].delta.content || ''
             
-            // 调试信息
-            // console.log(`Phase: ${phase}, Status: ${status}, Content长度: ${content.length}, 前20字符: "${content.substring(0, 20)}"`)
+            console.log(`处理SSE块: Phase=${phase}, Status=${status}, Content长度=${content.length}`)
             
-            // 关键修改：处理思考完成标记
+            // 关键点1: 处理思考完成标记
             if (phase === 'think' && status === 'finished') {
-              console.log('检测到思考阶段结束信号，发送结束标签并重置状态')
+              console.log('检测到思考阶段结束信号: phase=think, status=finished')
               
-              // 如果在思考阶段且还没有结束，发送思考结束标签
+              // 当收到think结束信号时，发送</think>标签
               if (isInThinkingPhase && !hasFinishedThinking) {
                 const endThinkTemplate = {
                   "id": `chatcmpl-${id}`,
@@ -309,6 +310,8 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
             if (phase) {
               // 检测阶段转换
               if (previousPhase !== phase) {
+                console.log(`阶段转换: ${previousPhase || 'null'} -> ${phase}`)
+                
                 // 从无到think - 添加开始标签
                 if (phase === 'think' && !isInThinkingPhase) {
                   content = '<think>' + content
@@ -318,7 +321,7 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
                 else if (previousPhase === 'think' && phase === 'answer') {
                   // 如果没有明确的思考结束信号但阶段已转换，强制插入结束标签
                   if (isInThinkingPhase && !hasFinishedThinking) {
-                    console.log('检测到phase从think切换到answer，但无明确结束信号，强制插入结束标签')
+                    console.log('检测到phase从think切换到answer，但无明确结束信号，插入结束标签')
                     const endThinkTemplate = {
                       "id": `chatcmpl-${id}`,
                       "object": "chat.completion.chunk",
@@ -341,20 +344,8 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
                   // 重置状态，准备回答阶段
                   isInThinkingPhase = false
                   
-                  // 清除可能包含的思考内容
-                  if (content && content.length > 0) {
-                    // 查找内容中是否包含完整的思考信息
-                    const thinkEndPos = content.indexOf('</think>')
-                    if (thinkEndPos !== -1) {
-                      // 只保留结束标签后的内容
-                      content = content.substring(thinkEndPos + 8) // 8 是 </think> 的长度
-                      console.log('发现结束标签，截取后内容长度:', content.length)
-                    } else if (/^(好的|我将|我需要|让我|思考|我来|我认为)/i.test(content)) {
-                      // 如果内容以典型思考起始语开头但无结束标签，可能是思考内容
-                      console.log('内容可能包含思考部分，但无法确定分割点，丢弃当前块')
-                      content = ''
-                    }
-                  }
+                  // 关键点2: 收到phase切换到answer时，重置backContent避免思考内容泄漏
+                  backContent = null
                 }
                 
                 previousPhase = phase
@@ -371,7 +362,7 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
                 // 前缀重复，只保留新部分
                 content = content.substring(backContent.length)
               } else {
-                // 尝试其他替换方法
+                // 尝试替换方法
                 content = content.replace(backContent, '')
               }
             }
