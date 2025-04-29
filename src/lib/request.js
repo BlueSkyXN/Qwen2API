@@ -34,9 +34,21 @@ const sendChatRequest = async (model, messages, stream, authToken) => {
   let thinkingEnabled = false
   if (model.includes('-thinking') || model.includes('qwq-32b')) {
     thinkingEnabled = true
-    messages[messages.length - 1].feature_config = {
-      "thinking_enabled": thinkingEnabled
+    
+    // 为qwen3系列模型添加特殊的思考配置
+    if (model.startsWith('qwen3')) {
+      messages[messages.length - 1].feature_config = {
+        "thinking_enabled": thinkingEnabled,
+        "output_schema": "phase",
+        "thinking_budget": 38912
+      }
+    } else {
+      // 原有模型的配置
+      messages[messages.length - 1].feature_config = {
+        "thinking_enabled": thinkingEnabled
+      }
     }
+    
     body.model = body.model.replace('-thinking', '')
   }
 
