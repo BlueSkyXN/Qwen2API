@@ -114,6 +114,7 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
     }
   }
 
+  // 原有的流处理函数 - 处理传统模型
   const streamResponse = async (response, thinkingEnabled) => {
     try {
       const id = uuid.v4()
@@ -122,8 +123,118 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
       let webSearchInfo = null
       let temp_content = ''
       let thinkEnd = false
+
+      response.on('start', () => {
+        setResHeader(true)
+      })
+
+      response.on('data', async (chunk) => {
+        const decodeText = decoder.decode(chunk, { stream: true })
+        // console.log(decodeText)
+        const lists = decodeText.split('\n').filter(item => item.trim() !== '')
+        for (const item of lists) {
+          try {
+            let decodeJson = isJson(item.replace("data: ", '')) ? JSON.parse(item.replace("data: ", '')) : null
+            if (decodeJson === null) {
+              temp_content += item
+              decodeJson = isJson(temp_content.replace("data: ", '')) ? JSON.parse(temp_content.replace("data: ", '')) : null
+              if (decodeJson === null) {
+                continue
+              }
+              temp_content = ''
+            }
+
+            // 处理 web_search 信息
+            if (decodeJson.choices[0].delta.name === 'web_search') {
+              webSearchInfo = decodeJson.choices[0].delta.extra.web_search_info
+            }
+
+            // 处理内容
+            let content = decodeJson.choices[0].delta.content
+
+            if (backContent !== null) {
+              content = content.replace(backContent, '')
+            }
+
+            backContent = decodeJson.choices[0].delta.content
+
+            if (thinkingEnabled && process.env.OUTPUT_THINK === "false" && !thinkEnd && !backContent.includes("</think>")) {
+              continue
+            } else if (thinkingEnabled && process.env.OUTPUT_THINK === "false" && !thinkEnd && backContent.includes("</think>")) {
+              content = content.replace("</think>", "")
+              thinkEnd = true
+            }
+
+            if (webSearchInfo && process.env.OUTPUT_THINK === "true") {
+              if (thinkingEnabled && content.includes("<think>")) {
+                content = content.replace("<think>", `<think>\n\n\n${await accountManager.generateMarkdownTable(webSearchInfo, process.env.SEARCH_INFO_MODE || "table")}\n\n\n`)
+                webSearchInfo = null
+              } else if (!thinkingEnabled) {
+                content = `<think>\n${await accountManager.generateMarkdownTable(webSearchInfo, process.env.SEARCH_INFO_MODE || "table")}\n</think>\n${content}`
+                webSearchInfo = null
+              }
+            }
+            // console.log(content)
+
+            const StreamTemplate = {
+              "id": `chatcmpl-${id}`,
+              "object": "chat.completion.chunk",
+              "created": new Date().getTime(),
+              "choices": [
+                {
+                  "index": 0,
+                  "delta": {
+                    "content": content
+                  },
+                  "finish_reason": null
+                }
+              ]
+            }
+            res.write(`data: ${JSON.stringify(StreamTemplate)}\n\n`)
+          } catch (error) {
+            console.log(error)
+            res.status(500).json({ error: "服务错误!!!" })
+          }
+        }
+      })
+
+      response.on('end', async () => {
+        if (process.env.OUTPUT_THINK === "false" && webSearchInfo) {
+          const webSearchTable = await accountManager.generateMarkdownTable(webSearchInfo, process.env.SEARCH_INFO_MODE || "table")
+          res.write(`data: ${JSON.stringify({
+            "id": `chatcmpl-${id}`,
+            "object": "chat.completion.chunk",
+            "created": new Date().getTime(),
+            "choices": [
+              {
+                "index": 0,
+                "delta": {
+                  "content": `\n\n\n${webSearchTable}`
+                }
+              }
+            ]
+          })}\n\n`)
+        }
+        res.write(`data: [DONE]\n\n`)
+        res.end()
+      })
+    } catch (error) {
+      console.log(error)
+      res.status(500).json({ error: "服务错误!!!" })
+    }
+  }
+
+  // 新增函数 - 专门处理Qwen3系列模型的思考输出
+  const streamResponseQwen3 = async (response, thinkingEnabled) => {
+    try {
+      const id = uuid.v4()
+      const decoder = new TextDecoder('utf-8')
+      let backContent = null
+      let webSearchInfo = null
+      let temp_content = ''
+      let thinkEnd = false
       
-      // 新增变量，用于处理phase标记的思考过程
+      // 用于处理phase标记的思考过程
       let previousPhase = null
       let isInThinkingPhase = false
 
@@ -155,7 +266,7 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
             // 处理内容
             let content = decodeJson.choices[0].delta.content || ''
             
-            // 处理phase标记的思考过程 (针对Qwen3系列模型)
+            // 处理phase标记的思考过程
             if (decodeJson.choices[0].delta.phase) {
               const currentPhase = decodeJson.choices[0].delta.phase
               
@@ -184,7 +295,6 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
 
             // 处理思考内容的显示/隐藏逻辑
             if (thinkingEnabled && process.env.OUTPUT_THINK === "false") {
-              // 针对老模型和新转换的phase模型，都能处理<think>标签
               if (!thinkEnd) {
                 // 如果内容中包含</think>，说明思考结束
                 if (content.includes("</think>")) {
@@ -208,7 +318,7 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
                 webSearchInfo = null
               }
             }
-            // console.log(content)
+
             // 确保有内容才发送
             if (content) {
               const StreamTemplate = {
@@ -309,7 +419,16 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
         res.write(`data: [DONE]\n\n`)
         res.end()
       } else {
-        streamResponse(response_data.response, (req.body.model.includes('-thinking') || req.body.model.includes('qwq-32b')) ? true : false)
+        // 判断是否为Qwen3模型并启用了思考模式
+        const isQwen3 = req.body.model.startsWith('qwen3')
+        const thinkingEnabled = (req.body.model.includes('-thinking') || req.body.model.includes('qwq-32b'))
+        
+        // 根据模型类型选择相应的处理函数
+        if (isQwen3 && thinkingEnabled) {
+          streamResponseQwen3(response_data.response, true)
+        } else {
+          streamResponse(response_data.response, thinkingEnabled)
+        }
       }
 
     } else {
