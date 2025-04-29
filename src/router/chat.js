@@ -126,11 +126,11 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
       // 新增变量，用于处理phase标记的思考过程
       let previousPhase = null
       let isInThinkingPhase = false
-      
+
       response.on('start', () => {
         setResHeader(true)
       })
-  
+
       response.on('data', async (chunk) => {
         const decodeText = decoder.decode(chunk, { stream: true })
         // console.log(decodeText)
@@ -146,12 +146,12 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
               }
               temp_content = ''
             }
-  
+
             // 处理 web_search 信息
             if (decodeJson.choices[0].delta.name === 'web_search') {
               webSearchInfo = decodeJson.choices[0].delta.extra.web_search_info
             }
-  
+
             // 处理内容
             let content = decodeJson.choices[0].delta.content || ''
             
@@ -175,13 +175,13 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
                 previousPhase = currentPhase
               }
             }
-  
+
             if (backContent !== null) {
               content = content.replace(backContent, '')
             }
-  
+
             backContent = decodeJson.choices[0].delta.content || ''
-  
+
             // 处理思考内容的显示/隐藏逻辑
             if (thinkingEnabled && process.env.OUTPUT_THINK === "false") {
               // 针对老模型和新转换的phase模型，都能处理<think>标签
@@ -197,7 +197,7 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
                 }
               }
             }
-  
+
             // 处理搜索信息
             if (webSearchInfo && process.env.OUTPUT_THINK === "true") {
               if (thinkingEnabled && content.includes("<think>")) {
@@ -233,6 +233,33 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
           }
         }
       })
+
+      response.on('end', async () => {
+        if (process.env.OUTPUT_THINK === "false" && webSearchInfo) {
+          const webSearchTable = await accountManager.generateMarkdownTable(webSearchInfo, process.env.SEARCH_INFO_MODE || "table")
+          res.write(`data: ${JSON.stringify({
+            "id": `chatcmpl-${id}`,
+            "object": "chat.completion.chunk",
+            "created": new Date().getTime(),
+            "choices": [
+              {
+                "index": 0,
+                "delta": {
+                  "content": `\n\n\n${webSearchTable}`
+                }
+              }
+            ]
+          })}\n\n`)
+        }
+        res.write(`data: [DONE]\n\n`)
+        res.end()
+      })
+    } catch (error) {
+      console.log(error)
+      res.status(500).json({ error: "服务错误!!!" })
+    }
+  }
+
   try {
     let response_data = null
     if (req.body.model.includes('-draw')) {
