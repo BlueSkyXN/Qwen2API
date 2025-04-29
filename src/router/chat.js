@@ -237,14 +237,15 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
       // 用于处理phase标记的思考过程
       let previousPhase = null
       let isInThinkingPhase = false
-
+      let hasFinishedThinking = false  // 新增：标记思考是否已结束
+      
       response.on('start', () => {
         setResHeader(true)
       })
 
       response.on('data', async (chunk) => {
         const decodeText = decoder.decode(chunk, { stream: true })
-        // console.log(decodeText)
+        // 调试用：console.log('原始SSE块:', decodeText)
         const lists = decodeText.split('\n').filter(item => item.trim() !== '')
         for (const item of lists) {
           try {
@@ -263,48 +264,128 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
               webSearchInfo = decodeJson.choices[0].delta.extra.web_search_info
             }
 
+            // 获取phase和status
+            const phase = decodeJson.choices[0].delta.phase || ''
+            const status = decodeJson.choices[0].delta.status || ''
+            
             // 处理内容
             let content = decodeJson.choices[0].delta.content || ''
             
-            // 处理phase标记的思考过程
-            if (decodeJson.choices[0].delta.phase) {
-              const currentPhase = decodeJson.choices[0].delta.phase
+            // 调试信息
+            // console.log(`Phase: ${phase}, Status: ${status}, Content长度: ${content.length}, 前20字符: "${content.substring(0, 20)}"`)
+            
+            // 关键修改：处理思考完成标记
+            if (phase === 'think' && status === 'finished') {
+              console.log('检测到思考阶段结束信号，发送结束标签并重置状态')
               
+              // 如果在思考阶段且还没有结束，发送思考结束标签
+              if (isInThinkingPhase && !hasFinishedThinking) {
+                const endThinkTemplate = {
+                  "id": `chatcmpl-${id}`,
+                  "object": "chat.completion.chunk",
+                  "created": new Date().getTime(),
+                  "choices": [
+                    {
+                      "index": 0,
+                      "delta": {
+                        "content": "</think>"
+                      },
+                      "finish_reason": null
+                    }
+                  ]
+                }
+                res.write(`data: ${JSON.stringify(endThinkTemplate)}\n\n`)
+                hasFinishedThinking = true
+                thinkEnd = true
+              }
+              
+              // 重置临时内容状态，防止后续答案阶段包含思考内容
+              backContent = null
+              content = ''
+              continue  // 跳过当前块，不发送空内容
+            }
+            
+            // 处理phase标记的思考过程和阶段转换
+            if (phase) {
               // 检测阶段转换
-              if (previousPhase !== currentPhase) {
+              if (previousPhase !== phase) {
                 // 从无到think - 添加开始标签
-                if (currentPhase === 'think' && !isInThinkingPhase) {
+                if (phase === 'think' && !isInThinkingPhase) {
                   content = '<think>' + content
                   isInThinkingPhase = true
                 } 
-                // 从think到answer - 添加结束标签
-                else if (previousPhase === 'think' && currentPhase === 'answer' && isInThinkingPhase) {
-                  content = '</think>' + content
+                // 从think到answer - 确保思考已正常结束
+                else if (previousPhase === 'think' && phase === 'answer') {
+                  // 如果没有明确的思考结束信号但阶段已转换，强制插入结束标签
+                  if (isInThinkingPhase && !hasFinishedThinking) {
+                    console.log('检测到phase从think切换到answer，但无明确结束信号，强制插入结束标签')
+                    const endThinkTemplate = {
+                      "id": `chatcmpl-${id}`,
+                      "object": "chat.completion.chunk",
+                      "created": new Date().getTime(),
+                      "choices": [
+                        {
+                          "index": 0,
+                          "delta": {
+                            "content": "</think>"
+                          },
+                          "finish_reason": null
+                        }
+                      ]
+                    }
+                    res.write(`data: ${JSON.stringify(endThinkTemplate)}\n\n`)
+                    hasFinishedThinking = true
+                    thinkEnd = true
+                  }
+                  
+                  // 重置状态，准备回答阶段
                   isInThinkingPhase = false
+                  
+                  // 清除可能包含的思考内容
+                  if (content && content.length > 0) {
+                    // 查找内容中是否包含完整的思考信息
+                    const thinkEndPos = content.indexOf('</think>')
+                    if (thinkEndPos !== -1) {
+                      // 只保留结束标签后的内容
+                      content = content.substring(thinkEndPos + 8) // 8 是 </think> 的长度
+                      console.log('发现结束标签，截取后内容长度:', content.length)
+                    } else if (/^(好的|我将|我需要|让我|思考|我来|我认为)/i.test(content)) {
+                      // 如果内容以典型思考起始语开头但无结束标签，可能是思考内容
+                      console.log('内容可能包含思考部分，但无法确定分割点，丢弃当前块')
+                      content = ''
+                    }
+                  }
                 }
                 
-                previousPhase = currentPhase
+                previousPhase = phase
               }
             }
 
-            if (backContent !== null) {
-              content = content.replace(backContent, '')
+            // 处理重复内容
+            if (backContent !== null && content) {
+              // 使用更精确的方法检测重复
+              if (content === backContent) {
+                // 完全相同的内容，跳过
+                continue
+              } else if (content.startsWith(backContent)) {
+                // 前缀重复，只保留新部分
+                content = content.substring(backContent.length)
+              } else {
+                // 尝试其他替换方法
+                content = content.replace(backContent, '')
+              }
             }
-
-            backContent = decodeJson.choices[0].delta.content || ''
+            
+            // 更新上一个内容
+            if (content) {
+              backContent = decodeJson.choices[0].delta.content || ''
+            }
 
             // 处理思考内容的显示/隐藏逻辑
             if (thinkingEnabled && process.env.OUTPUT_THINK === "false") {
               if (!thinkEnd) {
-                // 如果内容中包含</think>，说明思考结束
-                if (content.includes("</think>")) {
-                  content = content.replace("</think>", "")
-                  thinkEnd = true
-                } 
-                // 如果思考还未结束，且没有</think>标签，跳过输出
-                else if (!content.includes("</think>")) {
-                  continue
-                }
+                // 思考未结束且不显示思考内容时跳过
+                continue
               }
             }
 
@@ -338,13 +419,14 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
               res.write(`data: ${JSON.stringify(StreamTemplate)}\n\n`)
             }
           } catch (error) {
-            console.log(error)
+            console.log('处理SSE块时出错:', error)
             res.status(500).json({ error: "服务错误!!!" })
           }
         }
       })
 
       response.on('end', async () => {
+        // 处理结束逻辑保持不变
         if (process.env.OUTPUT_THINK === "false" && webSearchInfo) {
           const webSearchTable = await accountManager.generateMarkdownTable(webSearchInfo, process.env.SEARCH_INFO_MODE || "table")
           res.write(`data: ${JSON.stringify({
@@ -361,11 +443,12 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
             ]
           })}\n\n`)
         }
+        console.log('SSE响应结束')
         res.write(`data: [DONE]\n\n`)
         res.end()
       })
     } catch (error) {
-      console.log(error)
+      console.log('streamResponseQwen3函数出错:', error)
       res.status(500).json({ error: "服务错误!!!" })
     }
   }
