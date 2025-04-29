@@ -237,8 +237,7 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
       // 用于处理phase标记的思考过程
       let previousPhase = null
       let isInThinkingPhase = false
-      let hasFinishedThinking = false
-      
+
       response.on('start', () => {
         setResHeader(true)
       })
@@ -264,83 +263,47 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
               webSearchInfo = decodeJson.choices[0].delta.extra.web_search_info
             }
 
-            // 获取phase和status
-            const phase = decodeJson.choices[0].delta.phase || ''
-            const status = decodeJson.choices[0].delta.status || ''
-            
             // 处理内容
             let content = decodeJson.choices[0].delta.content || ''
             
-            // 思考完成标记
-            if (phase === 'think' && status === 'finished') {
-              hasFinishedThinking = true
-              continue // 跳过空内容的思考结束标记
-            }
-            
             // 处理phase标记的思考过程
-            if (phase) {
+            if (decodeJson.choices[0].delta.phase) {
+              const currentPhase = decodeJson.choices[0].delta.phase
+              
               // 检测阶段转换
-              if (previousPhase !== phase) {
+              if (previousPhase !== currentPhase) {
                 // 从无到think - 添加开始标签
-                if (phase === 'think' && !isInThinkingPhase) {
+                if (currentPhase === 'think' && !isInThinkingPhase) {
                   content = '<think>' + content
                   isInThinkingPhase = true
                 } 
-                // 从think到answer - 检查并添加结束标签
-                else if (previousPhase === 'think' && phase === 'answer' && isInThinkingPhase) {
-                  // 检查这个块是否包含大量内容（可能是完整思考内容）
-                  if (content.length > 100 && content.includes('好的')) {
-                    // 这里可能包含了完整的思考内容
-                    // 我们可以寻找一个明确的分隔点，比如第一个句号或其他标记
-                    // 找到思考内容的结束点（通常是几个换行符之后）
-                    let cutPoint = -1;
-                    
-                    // 方法1：寻找多个连续换行，这通常表示段落的结束
-                    const matches = content.match(/\n\n\n/);
-                    if (matches && matches.index > 10) {
-                      cutPoint = matches.index;
-                    }
-                    
-                    // 如果找到了合适的切分点
-                    if (cutPoint > 0) {
-                      // 只保留切分点之后的内容
-                      content = '</think>' + content.substring(cutPoint);
-                    } else {
-                      // 如果没找到清晰的分隔点，使用启发式方法：
-                      // 检查是否包含明确的思考结束标志，例如对问题的概述总结
-                      // 此处只添加结束标签，不截断内容（这可能会导致一些重复，但避免了丢失内容）
-                      content = '</think>' + content;
-                    }
-                  } else {
-                    // 普通过渡块，直接添加结束标签
-                    content = '</think>' + content;
-                  }
-                  
-                  isInThinkingPhase = false;
-                  thinkEnd = true;
+                // 从think到answer - 添加结束标签
+                else if (previousPhase === 'think' && currentPhase === 'answer' && isInThinkingPhase) {
+                  content = '</think>' + content
+                  isInThinkingPhase = false
                 }
                 
-                previousPhase = phase;
+                previousPhase = currentPhase
               }
             }
 
-            // 处理重复内容
             if (backContent !== null) {
-              content = content.replace(backContent, '');
+              content = content.replace(backContent, '')
             }
-            backContent = decodeJson.choices[0].delta.content || '';
+
+            backContent = decodeJson.choices[0].delta.content || ''
 
             // 处理思考内容的显示/隐藏逻辑
             if (thinkingEnabled && process.env.OUTPUT_THINK === "false") {
               if (!thinkEnd) {
                 // 如果内容中包含</think>，说明思考结束
                 if (content.includes("</think>")) {
-                  content = content.replace("</think>", "");
-                  thinkEnd = true;
+                  content = content.replace("</think>", "")
+                  thinkEnd = true
                 } 
                 // 如果思考还未结束，且没有</think>标签，跳过输出
                 else if (!content.includes("</think>")) {
-                  continue;
+                  continue
                 }
               }
             }
@@ -348,11 +311,11 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
             // 处理搜索信息
             if (webSearchInfo && process.env.OUTPUT_THINK === "true") {
               if (thinkingEnabled && content.includes("<think>")) {
-                content = content.replace("<think>", `<think>\n\n\n${await accountManager.generateMarkdownTable(webSearchInfo, process.env.SEARCH_INFO_MODE || "table")}\n\n\n`);
-                webSearchInfo = null;
+                content = content.replace("<think>", `<think>\n\n\n${await accountManager.generateMarkdownTable(webSearchInfo, process.env.SEARCH_INFO_MODE || "table")}\n\n\n`)
+                webSearchInfo = null
               } else if (!thinkingEnabled) {
-                content = `<think>\n${await accountManager.generateMarkdownTable(webSearchInfo, process.env.SEARCH_INFO_MODE || "table")}\n</think>\n${content}`;
-                webSearchInfo = null;
+                content = `<think>\n${await accountManager.generateMarkdownTable(webSearchInfo, process.env.SEARCH_INFO_MODE || "table")}\n</think>\n${content}`
+                webSearchInfo = null
               }
             }
 
@@ -371,19 +334,19 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
                     "finish_reason": null
                   }
                 ]
-              };
-              res.write(`data: ${JSON.stringify(StreamTemplate)}\n\n`);
+              }
+              res.write(`data: ${JSON.stringify(StreamTemplate)}\n\n`)
             }
           } catch (error) {
-            console.log(error);
-            res.status(500).json({ error: "服务错误!!!" });
+            console.log(error)
+            res.status(500).json({ error: "服务错误!!!" })
           }
         }
-      });
+      })
 
       response.on('end', async () => {
         if (process.env.OUTPUT_THINK === "false" && webSearchInfo) {
-          const webSearchTable = await accountManager.generateMarkdownTable(webSearchInfo, process.env.SEARCH_INFO_MODE || "table");
+          const webSearchTable = await accountManager.generateMarkdownTable(webSearchInfo, process.env.SEARCH_INFO_MODE || "table")
           res.write(`data: ${JSON.stringify({
             "id": `chatcmpl-${id}`,
             "object": "chat.completion.chunk",
@@ -396,14 +359,14 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
                 }
               }
             ]
-          })}\n\n`);
+          })}\n\n`)
         }
-        res.write(`data: [DONE]\n\n`);
-        res.end();
-      });
+        res.write(`data: [DONE]\n\n`)
+        res.end()
+      })
     } catch (error) {
-      console.log(error);
-      res.status(500).json({ error: "服务错误!!!" });
+      console.log(error)
+      res.status(500).json({ error: "服务错误!!!" })
     }
   }
 
