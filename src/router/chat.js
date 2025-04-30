@@ -232,22 +232,22 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
       let webSearchInfo = null
       let temp_content = ''
       
-      // 核心变量：用于收集思考内容
-      let completeThinkContent = ""  // 收集完整的思考内容(不含标签)
-      let completeAnswerContent = "" // 收集完整的已发送回答内容
-      let previousPhase = null       // 前一个阶段
+      // 跟踪变量
+      let completeThinkContent = ""  // 完整思考内容
+      let completeAnswerContent = "" // 已发送的回答内容
+      let previousPhase = null       // 前一阶段
       let currentPhase = null        // 当前阶段 
-      let isInThinkingPhase = false  // 是否处于思考阶段
+      let isInThinkingPhase = false  // 是否在思考阶段
       let thinkEndSent = false       // 是否已发送思考结束标签
       let thinkStartSent = false     // 是否已发送思考开始标签
-      let isFirstAnswerChunk = true  // 是否是答案阶段的第一个块
+      let lastSentLength = 0         // 上次发送的内容长度
       
       // 设置响应头
       response.on('start', () => {
         setResHeader(true)
       })
 
-      // 辅助函数：发送SSE消息
+      // 发送SSE消息的辅助函数
       const sendSSE = (content) => {
         if (!content || content.length === 0) return;
         
@@ -269,11 +269,100 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
         }
         res.write(`data: ${JSON.stringify(streamTemplate)}\n\n`)
         
-        // 如果是回答阶段的内容，添加到已发送内容中
-        if (currentPhase === 'answer' && !isInThinkingPhase) {
-          completeAnswerContent += content
-        }
+        // 更新已发送内容
+        completeAnswerContent += content
+        lastSentLength = content.length
       }
+
+      // 提取真正的增量内容
+      const getIncrementalContent = (newContent) => {
+        // 无内容或已发送内容为空时，直接返回
+        if (!newContent || newContent.length === 0) return "";
+        if (completeAnswerContent.length === 0) return newContent;
+        
+        // 策略1: 完全包含检测
+        if (completeAnswerContent.includes(newContent)) {
+          console.log(`当前内容已完全包含在前序内容中，跳过`)
+          return "";
+        }
+        
+        // 策略2: 全量更新检测 - 新内容包含所有已发送内容
+        if (newContent.includes(completeAnswerContent)) {
+          const newPart = newContent.substring(completeAnswerContent.length);
+          console.log(`全量更新: 提取新增部分，长度为 ${newPart.length}`);
+          return newPart;
+        }
+        
+        // 策略3: 最大重叠检测 - 找出已发送内容结尾和新内容开头的最大重叠
+        let maxOverlap = 0;
+        // 限制检查长度，避免性能问题
+        const checkLength = Math.min(1000, completeAnswerContent.length);
+        const endPart = completeAnswerContent.substring(completeAnswerContent.length - checkLength);
+        
+        for (let i = Math.min(newContent.length, checkLength); i > 0; i--) {
+          if (endPart.endsWith(newContent.substring(0, i))) {
+            maxOverlap = i;
+            break;
+          }
+        }
+        
+        if (maxOverlap > 0) {
+          const incrementalPart = newContent.substring(maxOverlap);
+          console.log(`找到重叠内容(${maxOverlap}字符)，增量部分长度为 ${incrementalPart.length}`);
+          return incrementalPart;
+        }
+        
+        // 策略4: 模糊匹配 - 分词并查找共同部分
+        if (newContent.length > 50 && completeAnswerContent.length > 100) {
+          // 取新内容的前50个字符在已发送内容中查找
+          const prefix = newContent.substring(0, 50);
+          const position = completeAnswerContent.indexOf(prefix);
+          
+          if (position >= 0) {
+            // 找到匹配，检查后续内容
+            const matchedPart = completeAnswerContent.substring(position);
+            let matchLength = 0;
+            
+            // 找出完全匹配的长度
+            while (matchLength < matchedPart.length && 
+                  matchLength < newContent.length && 
+                  matchedPart[matchLength] === newContent[matchLength]) {
+              matchLength++;
+            }
+            
+            if (matchLength > 50) {
+              console.log(`模糊匹配: 找到${matchLength}字符的匹配，提取后续内容`);
+              return newContent.substring(matchLength);
+            }
+          }
+        }
+        
+        // 策略5: 内容相似度检测 - 处理极端情况
+        // 如果新内容与已发送内容非常相似(仅少量差异)但不完全匹配
+        if (newContent.length > completeAnswerContent.length * 0.9 && 
+            newContent.length < completeAnswerContent.length * 1.1) {
+          // 比较新旧内容的开头部分
+          const minLength = Math.min(newContent.length, completeAnswerContent.length);
+          let diffStart = 0;
+          
+          // 找出内容开始不同的位置
+          while (diffStart < minLength && 
+                newContent[diffStart] === completeAnswerContent[diffStart]) {
+            diffStart++;
+          }
+          
+          // 如果开头高度相似(90%以上相同)，可能是轻微变更的全量更新
+          if (diffStart > minLength * 0.9) {
+            console.log(`检测到高相似度内容，仅提取差异部分`);
+            return newContent.substring(diffStart);
+          }
+        }
+        
+        // 默认情况：无法识别增量模式，返回完整内容
+        // 这种情况下可能会有重复，但避免了内容丢失
+        console.log(`无法确定增量内容，返回完整内容(可能有重复)`);
+        return newContent;
+      };
 
       // 处理数据块
       response.on('data', async (chunk) => {
@@ -300,33 +389,32 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
               webSearchInfo = decodeJson.choices[0].delta.extra.web_search_info
             }
 
-            // 获取phase和status - 关键部分
+            // 获取phase和status
             const phase = decodeJson.choices[0].delta.phase || ''
             const status = decodeJson.choices[0].delta.status || ''
             let content = decodeJson.choices[0].delta.content || ''
             
             console.log(`处理SSE块: Phase=${phase}, Status=${status}, Content长度=${content.length}`)
             
-            // 检测phase变化 - 关键部分
+            // 阶段变化检测
             if (phase && phase !== currentPhase) {
               previousPhase = currentPhase
               currentPhase = phase
               console.log(`阶段转换: ${previousPhase || 'null'} -> ${phase}`)
               
-              // 处理从think到answer的转换
+              // 从think转到answer
               if (previousPhase === 'think' && currentPhase === 'answer') {
                 console.log(`思考阶段结束，收集到的完整思考内容长度: ${completeThinkContent.length}`)
                 
-                // 如果未发送思考结束标签，发送它
+                // 确保思考标签闭合
                 if (!thinkEndSent && thinkStartSent) {
                   sendSSE("</think>")
                   thinkEndSent = true
                 }
                 
-                isFirstAnswerChunk = true
                 isInThinkingPhase = false
               }
-              // 处理进入think阶段
+              // 进入think阶段
               else if (currentPhase === 'think') {
                 isInThinkingPhase = true
               }
@@ -336,7 +424,7 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
             if (phase === 'think' && status === 'finished') {
               console.log('检测到思考阶段结束信号')
               
-              // 如果未发送思考结束标签，发送它
+              // 确保思考标签闭合
               if (!thinkEndSent && thinkStartSent) {
                 sendSSE("</think>")
                 thinkEndSent = true
@@ -349,8 +437,8 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
             // 没有内容则跳过
             if (!content || content.length === 0) continue
             
-            // 处理思考阶段内容 - 关键部分
-            if (isInThinkingPhase) {
+            // 处理思考阶段内容
+            if (isInThinkingPhase || phase === 'think') {
               // 收集思考内容
               completeThinkContent += content
               
@@ -364,96 +452,42 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
               if (thinkingEnabled && process.env.OUTPUT_THINK === "false") {
                 continue
               }
-            }
-            // 处理回答阶段内容 - 关键部分
-            else if (currentPhase === 'answer') {
-              // 关键逻辑：处理回答阶段的第一个消息
-              if (isFirstAnswerChunk) {
-                console.log(`处理首个回答块，内容长度: ${content.length}`)
-                
-                // 检查内容是否包含完整的思考内容
-                if (completeThinkContent && completeThinkContent.length > 0) {
-                  if (content.includes(completeThinkContent)) {
-                    // 找到思考内容在全量回答中的位置
-                    const index = content.indexOf(completeThinkContent)
-                    
-                    // 如果思考内容在开头，则直接截取后面部分
-                    if (index === 0) {
-                      content = content.substring(completeThinkContent.length)
-                    }
-                    // 如果思考内容在中间某处，可能是全量模式，分析情况
-                    else {
-                      // 尝试查找完整的<think>内容</think>位置
-                      const thinkTagStart = content.indexOf("<think>")
-                      const thinkTagEnd = content.indexOf("</think>")
-                      
-                      if (thinkTagStart >= 0 && thinkTagEnd > thinkTagStart) {
-                        // 有完整思考标签，提取标签后的内容
-                        content = content.substring(thinkTagEnd + 8) // 8是</think>的长度
-                      } else {
-                        // 没有完整标签，但有思考内容，直接跳过思考内容
-                        content = content.substring(index + completeThinkContent.length)
-                      }
-                    }
-                    
-                    console.log(`移除完整思考内容后，剩余内容长度: ${content.length}`)
-                  }
-                  // 即使没有精确匹配，也尝试查找部分匹配
-                  else {
-                    // 寻找思考内容的后半部分是否在answer内容开头
-                    for (let i = Math.floor(completeThinkContent.length / 2); i > 10; i--) {
-                      const thinkEnd = completeThinkContent.substring(completeThinkContent.length - i)
-                      if (content.startsWith(thinkEnd)) {
-                        content = content.substring(i)
-                        console.log(`通过部分匹配移除重叠内容，剩余长度: ${content.length}`)
-                        break
-                      }
-                    }
-                  }
-                }
-                
-                isFirstAnswerChunk = false
-              }
-              // 新增：处理后续回答块，确保只发送增量内容
-              else {
-                // 检查是否包含已发送的回答内容
-                if (completeAnswerContent && completeAnswerContent.length > 0) {
-                  // 情况1: 当前内容完全包含在已发送内容中
-                  if (completeAnswerContent.includes(content)) {
-                    console.log(`当前内容已完全包含在前序内容中，跳过`)
-                    continue;
-                  }
-                  
-                  // 情况2: 当前内容是全量模式，包含所有已发送内容
-                  if (content.includes(completeAnswerContent)) {
-                    content = content.substring(completeAnswerContent.length)
-                    console.log(`移除已发送内容，剩余长度: ${content.length}`)
-                  } 
-                  // 情况3: 与已发送内容存在部分重叠
-                  else {
-                    // 寻找最大重叠部分
-                    let maxOverlap = 0;
-                    const maxCheck = Math.min(content.length, completeAnswerContent.length);
-                    
-                    // 检查已发送内容的尾部与当前内容的头部的重叠
-                    for (let i = 1; i <= maxCheck; i++) {
-                      if (completeAnswerContent.endsWith(content.substring(0, i))) {
-                        maxOverlap = i;
-                      }
-                    }
-                    
-                    if (maxOverlap > 0) {
-                      content = content.substring(maxOverlap)
-                      console.log(`移除与已发送内容重叠部分，剩余长度: ${content.length}`)
-                    }
-                  }
-                }
-              }
-            }
-            
-            // 发送实际内容
-            if (content && content.length > 0) {
+              
+              // 发送思考内容
               sendSSE(content)
+            }
+            // 处理回答阶段内容
+            else if (currentPhase === 'answer' || phase === 'answer') {
+              // 处理第一个回答块 - 可能包含思考内容
+              if (completeThinkContent && completeThinkContent.length > 0 && completeAnswerContent.length === 0) {
+                console.log(`处理首个回答块，检查是否包含思考内容`);
+                
+                // 检查内容是否包含完整思考内容
+                if (content.includes(completeThinkContent)) {
+                  // 从内容中移除思考部分
+                  const thinkPos = content.indexOf(completeThinkContent);
+                  if (thinkPos >= 0) {
+                    // 移除思考内容及其前后的部分
+                    content = content.substring(thinkPos + completeThinkContent.length);
+                    console.log(`已移除思考内容，剩余长度: ${content.length}`);
+                    
+                    // 查找并移除可能的</think>标签
+                    const thinkEndPos = content.indexOf("</think>");
+                    if (thinkEndPos >= 0) {
+                      content = content.substring(thinkEndPos + 8); // 8是</think>的长度
+                      console.log(`已移除</think>标签，剩余长度: ${content.length}`);
+                    }
+                  }
+                }
+              }
+              
+              // 提取真正的增量内容
+              const incrementalContent = getIncrementalContent(content);
+              
+              // 只发送增量内容
+              if (incrementalContent && incrementalContent.length > 0) {
+                sendSSE(incrementalContent);
+              }
             }
             
           } catch (error) {
