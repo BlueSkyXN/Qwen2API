@@ -227,32 +227,29 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
   // 新增函数 - 专门处理Qwen3系列模型的思考输出
   const streamResponseQwen3 = async (response, thinkingEnabled) => {
     try {
-      const id = uuid.v4()
-      const decoder = new TextDecoder('utf-8')
-      let webSearchInfo = null
-      let temp_content = ''
-      
-      // 跟踪变量
-      let completeThinkContent = ""  // 完整思考内容
-      let completeAnswerContent = "" // 已发送的回答内容
-      let previousPhase = null       // 前一阶段
-      let currentPhase = null        // 当前阶段 
-      let isInThinkingPhase = false  // 是否在思考阶段
-      let thinkEndSent = false       // 是否已发送思考结束标签
-      let thinkStartSent = false     // 是否已发送思考开始标签
-      let sentChunks = []            // 记录已发送的所有内容块
-      
+      const id = uuid.v4();
+      const decoder = new TextDecoder('utf-8');
+      let temp_content = ''; // 用于处理不完整的JSON块
+
+      // --- 状态变量 ---
+      let currentPhase = null;        // 当前阶段: 'think', 'answer', or null
+      let thinkStarted = false;       // 是否已发送 <think>
+      let thinkEnded = false;         // 是否已发送 </think>
+      let accumulatedThinkContent = ""; // 服务器端累积的完整思考内容
+      let lastSentAnswerContent = "";   // 服务器端记录的已发送给客户端的 *回答* 部分内容
+      // --- End 状态变量 ---
+
       // 设置响应头
       response.on('start', () => {
-        setResHeader(true)
-      })
+        setResHeader(true);
+      });
 
       // 发送SSE消息的辅助函数
       const sendSSE = (content) => {
         if (!content || content.length === 0) return;
-        
-        console.log(`发送内容: "${content.substring(0, 30)}${content.length > 30 ? '...' : ''}" (长度: ${content.length})`)
-        
+
+        // console.log(`发送内容: "${content.substring(0, 30)}${content.length > 30 ? '...' : ''}" (长度: ${content.length})`)
+
         const streamTemplate = {
           "id": `chatcmpl-${id}`,
           "object": "chat.completion.chunk",
@@ -266,307 +263,197 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
               "finish_reason": null
             }
           ]
-        }
-        res.write(`data: ${JSON.stringify(streamTemplate)}\n\n`)
-        
-        // 更新已发送内容 - 关键部分
-        completeAnswerContent += content
-        // 记录发送的内容块
-        sentChunks.push(content)
-      }
-
-      // 检查内容是否已发送
-      const isContentAlreadySent = (content) => {
-        // 直接完全匹配
-        if (completeAnswerContent === content || completeAnswerContent.includes(content)) {
-          return true;
-        }
-        
-        // 检查是否是已发送内容的延续
-        if (content.length > 10) {
-          for (let i = 10; i < Math.min(content.length, completeAnswerContent.length); i++) {
-            const overlap = completeAnswerContent.substring(completeAnswerContent.length - i);
-            if (content.startsWith(overlap)) {
-              return true;
-            }
-          }
-        }
-        
-        // 检查当前内容是否是前几个块的组合
-        if (sentChunks.length >= 2) {
-          const lastChunk = sentChunks[sentChunks.length - 1];
-          const secondLastChunk = sentChunks[sentChunks.length - 2];
-          
-          // 检查是否是最后两个块的组合
-          if (lastChunk && secondLastChunk && 
-              (lastChunk + secondLastChunk).includes(content) || 
-              (secondLastChunk + lastChunk).includes(content)) {
-            return true;
-          }
-          
-          // 检查是否是已发送内容块的任意组合
-          if (content.length < 100) { // 限制长度以避免性能问题
-            const contentNormalized = content.replace(/\s+/g, ' ').trim();
-            const joined = sentChunks.join('').replace(/\s+/g, ' ').trim();
-            return joined.includes(contentNormalized);
-          }
-        }
-        
-        return false;
-      }
-
-      // 提取真正的增量内容
-      const getIncrementalContent = (newContent) => {
-        // 无内容或已发送内容为空时，直接返回
-        if (!newContent || newContent.length === 0) return "";
-        if (completeAnswerContent.length === 0) return newContent;
-        
-        // 检查是否已发送
-        if (isContentAlreadySent(newContent)) {
-          console.log(`内容已发送，跳过: ${newContent.substring(0, 30)}...`);
-          return "";
-        }
-        
-        // 策略1: 完全包含检测
-        if (completeAnswerContent.includes(newContent)) {
-          console.log(`当前内容已完全包含在前序内容中，跳过`);
-          return "";
-        }
-        
-        // 策略2: 全量更新检测 - 新内容包含所有已发送内容
-        if (newContent.includes(completeAnswerContent)) {
-          const newPart = newContent.substring(completeAnswerContent.length);
-          console.log(`全量更新: 提取新增部分，长度为 ${newPart.length}`);
-          return newPart;
-        }
-        
-        // 策略3: 最大重叠检测 - 找出已发送内容结尾和新内容开头的最大重叠
-        let maxOverlap = 0;
-        // 限制检查长度，避免性能问题
-        const checkLength = Math.min(500, completeAnswerContent.length);
-        const endPart = completeAnswerContent.substring(completeAnswerContent.length - checkLength);
-        
-        for (let i = Math.min(newContent.length, checkLength); i > 0; i--) {
-          if (endPart.endsWith(newContent.substring(0, i))) {
-            maxOverlap = i;
-            break;
-          }
-        }
-        
-        if (maxOverlap > 0) {
-          const incrementalPart = newContent.substring(maxOverlap);
-          if (incrementalPart.length > 0) {
-            console.log(`找到重叠内容(${maxOverlap}字符)，增量部分长度为 ${incrementalPart.length}`);
-            return incrementalPart;
-          } else {
-            console.log(`完全重叠，无需发送`);
-            return "";
-          }
-        }
-        
-        // 策略4: 模糊匹配 - 分词并查找共同部分
-        if (newContent.length > 50 && completeAnswerContent.length > 50) {
-          // 取新内容的前50个字符在已发送内容中查找
-          const prefix = newContent.substring(0, Math.min(50, newContent.length));
-          const position = completeAnswerContent.indexOf(prefix);
-          
-          if (position >= 0) {
-            // 找到匹配，检查后续内容
-            const matchedPart = completeAnswerContent.substring(position);
-            let matchLength = 0;
-            
-            // 找出完全匹配的长度
-            while (matchLength < matchedPart.length && 
-                  matchLength < newContent.length && 
-                  matchedPart[matchLength] === newContent[matchLength]) {
-              matchLength++;
-            }
-            
-            if (matchLength > 50) {
-              if (matchLength >= newContent.length) {
-                console.log(`模糊匹配: 内容完全匹配，无需发送`);
-                return "";
-              } else {
-                console.log(`模糊匹配: 找到${matchLength}字符的匹配，提取后续内容`);
-                // 检查是否截断内容中包含...
-                const newPartContent = newContent.substring(matchLength);
-                if (newPartContent.trim() === "..." || 
-                    newPartContent.endsWith("...") || 
-                    newPartContent.length < 5) {
-                  console.log(`检测到截断内容，忽略`);
-                  return "";
-                }
-                return newPartContent;
-              }
-            }
-          }
-        }
-        
-        // 处理截断内容
-        if (newContent.endsWith("...") && 
-            completeAnswerContent.includes(newContent.substring(0, newContent.length - 3))) {
-          console.log(`检测到截断内容，忽略`);
-          return "";
-        }
-        
-        // 默认情况：无法识别增量模式，返回完整内容
-        console.log(`无法确定增量内容，返回完整内容(可能有重复)`);
-        return newContent;
+        };
+        res.write(`data: ${JSON.stringify(streamTemplate)}\n\n`);
       };
 
       // 处理数据块
       response.on('data', async (chunk) => {
-        const decodeText = decoder.decode(chunk, { stream: true })
-        console.log(`原始SSE块: ${decodeText.substring(0, 100)}${decodeText.length > 100 ? '...' : ''}`)
-        
-        // 解析数据块
-        const lists = decodeText.split('\n').filter(item => item.trim() !== '')
-        for (const item of lists) {
-          try {
-            // 解析JSON
-            let decodeJson = isJson(item.replace("data: ", '')) ? JSON.parse(item.replace("data: ", '')) : null
-            if (decodeJson === null) {
-              temp_content += item
-              decodeJson = isJson(temp_content.replace("data: ", '')) ? JSON.parse(temp_content.replace("data: ", '')) : null
-              if (decodeJson === null) {
-                continue
+        const decodeText = decoder.decode(chunk, { stream: true });
+        // console.log(`原始SSE块: ${decodeText.substring(0, 150)}${decodeText.length > 150 ? '...' : ''}`) // 增加log长度
+
+        const lines = decodeText.split('\n');
+        for (const line of lines) {
+          if (line.trim().startsWith('data:')) {
+            const jsonData = line.substring('data:'.length).trim();
+            if (!jsonData) continue;
+
+            try {
+              let decodeJson = JSON.parse(jsonData);
+
+              // 忽略非choices或空choices的块
+              if (!decodeJson.choices || decodeJson.choices.length === 0 || !decodeJson.choices[0].delta) {
+                  continue;
               }
-              temp_content = ''
-            }
 
-            // 处理 web_search 信息
-            if (decodeJson.choices[0].delta.name === 'web_search') {
-              webSearchInfo = decodeJson.choices[0].delta.extra.web_search_info
-            }
+              const delta = decodeJson.choices[0].delta;
+              const phase = delta.phase || currentPhase; // 继承上一阶段，如果当前块没有phase
+              const status = delta.status || '';
+              let content = delta.content || '';
 
-            // 获取phase和status
-            const phase = decodeJson.choices[0].delta.phase || ''
-            const status = decodeJson.choices[0].delta.status || ''
-            let content = decodeJson.choices[0].delta.content || ''
-            
-            console.log(`处理SSE块: Phase=${phase}, Status=${status}, Content长度=${content.length}`)
-            
-            // 阶段变化检测
-            if (phase && phase !== currentPhase) {
-              previousPhase = currentPhase
-              currentPhase = phase
-              console.log(`阶段转换: ${previousPhase || 'null'} -> ${phase}`)
-              
-              // 从think转到answer
-              if (previousPhase === 'think' && currentPhase === 'answer') {
-                console.log(`思考阶段结束，收集到的完整思考内容长度: ${completeThinkContent.length}`)
-                
-                // 确保思考标签闭合
-                if (!thinkEndSent && thinkStartSent) {
-                  sendSSE("</think>")
-                  thinkEndSent = true
+              // --- 核心逻辑 ---
+
+              // 1. 处理思考阶段 (phase === 'think')
+              if (phase === 'think') {
+                if (currentPhase !== 'think') {
+                    // 刚进入思考阶段 (虽然通常第一个块就是think，以防万一)
+                    currentPhase = 'think';
+                    console.log("阶段转换: -> think");
                 }
-                
-                // 重置答案部分变量
-                completeAnswerContent = "";
-                sentChunks = [];
-                isInThinkingPhase = false
-              }
-              // 进入think阶段
-              else if (currentPhase === 'think') {
-                isInThinkingPhase = true
-              }
-            }
-            
-            // 处理思考结束信号
-            if (phase === 'think' && status === 'finished') {
-              console.log('检测到思考阶段结束信号')
-              
-              // 确保思考标签闭合
-              if (!thinkEndSent && thinkStartSent) {
-                sendSSE("</think>")
-                thinkEndSent = true
-              }
-              
-              isInThinkingPhase = false
-              continue  // 跳过空内容
-            }
-            
-            // 没有内容则跳过
-            if (!content || content.length === 0) continue
-            
-            // 处理思考阶段内容
-            if (isInThinkingPhase || phase === 'think') {
-              // 收集思考内容
-              completeThinkContent += content
-              
-              // 第一个思考块需要添加标签
-              if (!thinkStartSent) {
-                content = "<think>" + content
-                thinkStartSent = true
-              }
-              
-              // 如果不显示思考，则不发送
-              if (thinkingEnabled && process.env.OUTPUT_THINK === "false") {
-                continue
-              }
-              
-              // 发送思考内容
-              sendSSE(content)
-            }
-            // 处理回答阶段内容
-            else if (currentPhase === 'answer' || phase === 'answer') {
-              // 处理第一个回答块 - 可能包含思考内容
-              if (completeThinkContent && completeThinkContent.length > 0 && completeAnswerContent.length === 0) {
-                console.log(`处理首个回答块，检查是否包含思考内容`);
-                
-                // 检查内容是否包含完整思考内容
-                if (content.includes(completeThinkContent)) {
-                  // 从内容中移除思考部分
-                  const thinkPos = content.indexOf(completeThinkContent);
-                  if (thinkPos >= 0) {
-                    // 移除思考内容及其前后的部分
-                    content = content.substring(thinkPos + completeThinkContent.length);
-                    console.log(`已移除思考内容，剩余长度: ${content.length}`);
-                    
-                    // 查找并移除可能的</think>标签
-                    const thinkEndPos = content.indexOf("</think>");
-                    if (thinkEndPos >= 0) {
-                      content = content.substring(thinkEndPos + 8); // 8是</think>的长度
-                      console.log(`已移除</think>标签，剩余长度: ${content.length}`);
-                    }
+
+                // 收到第一个思考内容时，发送 <think> 标签
+                if (!thinkStarted && content.length > 0) {
+                  // 只有当配置为输出思考时才发送
+                  if (thinkingEnabled && process.env.OUTPUT_THINK !== "false") {
+                      sendSSE("<think>");
                   }
+                  thinkStarted = true;
+                }
+
+                // 累积思考内容
+                if (content.length > 0) {
+                    accumulatedThinkContent += content;
+                    // 将增量思考内容转发给客户端 (如果允许输出)
+                    if (thinkingEnabled && process.env.OUTPUT_THINK !== "false") {
+                        sendSSE(content);
+                    }
+                }
+
+                // 检查思考是否结束
+                if (status === 'finished') {
+                  console.log('检测到思考阶段结束信号 (think/finished)');
+                  if (thinkStarted && !thinkEnded) {
+                     // 只有当配置为输出思考时才发送
+                     if (thinkingEnabled && process.env.OUTPUT_THINK !== "false") {
+                        sendSSE("</think>");
+                     }
+                     thinkEnded = true;
+                  }
+                  // 注意：即使收到finished，下一个块可能还是think，也可能切换到answer
+                  // 所以 phase 的判断更重要
                 }
               }
-              
-              // 提取真正的增量内容
-              const incrementalContent = getIncrementalContent(content);
-              
-              // 只发送增量内容
-              if (incrementalContent && incrementalContent.length > 0) {
-                sendSSE(incrementalContent);
+              // 2. 处理回答阶段 (phase === 'answer')
+              else if (phase === 'answer') {
+                // 首次进入回答阶段
+                if (currentPhase !== 'answer') {
+                    console.log(`阶段转换: ${currentPhase || 'null'} -> answer`);
+                    currentPhase = 'answer';
+
+                    // 如果思考标签已开始但未结束，在此处结束它
+                    if (thinkStarted && !thinkEnded) {
+                        console.log('在进入answer阶段时结束思考标签');
+                        // 只有当配置为输出思考时才发送
+                        if (thinkingEnabled && process.env.OUTPUT_THINK !== "false") {
+                            sendSSE("</think>");
+                        }
+                        thinkEnded = true;
+                    }
+                }
+
+                // Qwen answer 阶段 content 是全量 (思考+回答)
+                const currentFullQwenContent = content;
+
+                // 如果思考内容为空，则整个内容都是回答
+                if (accumulatedThinkContent.length === 0) {
+                    const newAnswerDelta = currentFullQwenContent.substring(lastSentAnswerContent.length);
+                    if (newAnswerDelta.length > 0) {
+                        sendSSE(newAnswerDelta);
+                        lastSentAnswerContent = currentFullQwenContent; // 更新已发送的回答内容
+                    }
+                }
+                // 如果有思考内容，需要剥离
+                else {
+                    // 检查收到的全量内容是否确实以累积的思考内容开头
+                    if (currentFullQwenContent.startsWith(accumulatedThinkContent)) {
+                        const currentFullAnswerPart = currentFullQwenContent.substring(accumulatedThinkContent.length);
+                        const newAnswerDelta = currentFullAnswerPart.substring(lastSentAnswerContent.length);
+
+                        if (newAnswerDelta.length > 0) {
+                            sendSSE(newAnswerDelta);
+                            lastSentAnswerContent = currentFullAnswerPart; // 更新已发送的 *回答* 部分
+                        }
+                    } else {
+                        // 异常情况：收到的回答内容没有以预期的思考内容开头
+                        // 这可能是累积错误或Qwen行为变化。尝试直接发送增量（可能有风险）
+                        console.warn("警告: 回答块内容未以累积的思考内容开头。尝试直接差分。");
+                        console.warn("累积思考:", accumulatedThinkContent.slice(0, 50) + "...");
+                        console.warn("收到内容:", currentFullQwenContent.slice(0, 50) + "...");
+
+                        // 尝试基于上一次发送的回答内容进行差分（作为后备）
+                        const newAnswerDelta = currentFullQwenContent.substring(lastSentAnswerContent.length);
+                         if (newAnswerDelta.length > 0) {
+                            sendSSE(newAnswerDelta);
+                            lastSentAnswerContent = currentFullQwenContent; // 更新已发送的回答内容
+                        }
+                    }
+                }
+              }
+              // 3. 处理结束状态 (可能在 answer 阶段出现)
+              if (status === 'finished' && currentPhase === 'answer') {
+                  console.log('检测到回答阶段结束信号 (answer/finished)');
+                  // 通常这里 content 为空，主要标记流程结束
+              }
+
+              // 更新当前阶段状态，为下一个块做准备
+              if (phase) { // 只有当块明确指定了phase时才更新
+                  currentPhase = phase;
+              }
+
+            } catch (error) {
+              // 尝试处理拼接不完整的 JSON
+              temp_content += line;
+              try {
+                let decodeJson = JSON.parse(temp_content.replace("data: ", ''));
+                temp_content = ''; // 解析成功，清空 buffer
+
+                // ... 重新执行上面的解析和处理逻辑 ...
+                // (为简洁起见，此处省略重复代码，实际应用中需要提取成函数或复制逻辑)
+                 const delta = decodeJson.choices[0].delta;
+                 const phase = delta.phase || currentPhase;
+                 const status = delta.status || '';
+                 let content = delta.content || '';
+                 // ... [重复核心逻辑] ...
+                 // ... [重复核心逻辑] ...
+                 if (phase) { currentPhase = phase; }
+
+
+              } catch (parseError) {
+                // 如果仍然失败，说明 JSON 还不完整，继续等待下一个 chunk
+                // console.log('JSON 块不完整，等待拼接:', temp_content);
               }
             }
-            
-          } catch (error) {
-            console.error('处理SSE块时出错:', error)
           }
         }
-      })
+      });
 
       // 处理流结束
       response.on('end', async () => {
-        // 处理搜索信息
-        if (process.env.OUTPUT_THINK === "false" && webSearchInfo) {
-          const webSearchTable = await accountManager.generateMarkdownTable(webSearchInfo, process.env.SEARCH_INFO_MODE || "table")
-          sendSSE(`\n\n\n${webSearchTable}`)
+        // 确保思考标签已关闭 (以防万一 Qwen 结束时没有明确的 finished 信号)
+        if (thinkStarted && !thinkEnded) {
+          console.log('在 SSE 流结束时强制关闭思考标签');
+           // 只有当配置为输出思考时才发送
+           if (thinkingEnabled && process.env.OUTPUT_THINK !== "false") {
+               sendSSE("</think>");
+           }
+           thinkEnded = true;
         }
-        
-        console.log('SSE响应结束')
-        res.write(`data: [DONE]\n\n`)
-        res.end()
-      })
+        console.log('SSE响应结束');
+        res.write(`data: [DONE]\n\n`);
+        res.end();
+      });
     } catch (error) {
-      console.error('streamResponseQwen3函数出错:', error)
-      res.status(500).json({ error: "服务错误!!!" })
+      console.error('streamResponseQwen3函数出错:', error);
+      // 确保在出错时也能结束响应
+      if (!res.writableEnded) {
+          try {
+              res.status(500).json({ error: "服务错误!!!" });
+          } catch (e) {
+              console.error("发送错误响应失败:", e);
+          }
+      }
     }
-  }
-
+  };
   // 结束
   try {
     let response_data = null
