@@ -224,31 +224,33 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
     }
   }
 
-  // 新增函数 - 专门处理Qwen3系列模型的思考输出，完全重建SSE流，强制实现增量传输
+  // 新增函数 - 专门处理Qwen3系列模型的思考输出
   const streamResponseQwen3 = async (response, thinkingEnabled) => {
     try {
       const id = uuid.v4()
       const decoder = new TextDecoder('utf-8')
-      let temp_content = ''
       let webSearchInfo = null
+      let temp_content = ''
       
-      // 状态追踪变量
-      let completeContent = ""        // 已发送的全部内容
-      let currentPhase = null         // 当前阶段
-      let previousPhase = null        // 前一个阶段
-      let isInThinkingPhase = false   // 是否处于思考阶段
-      let hasFinishedThinking = false // 是否已完成思考
-      let thinkContent = ""           // 完整思考内容
-      let phaseJustChanged = false    // 阶段是否刚刚改变
+      // 核心变量：用于收集思考内容
+      let completeThinkContent = ""  // 收集完整的思考内容(不含标签)
+      let previousPhase = null       // 前一个阶段
+      let currentPhase = null        // 当前阶段 
+      let isInThinkingPhase = false  // 是否处于思考阶段
+      let thinkEndSent = false       // 是否已发送思考结束标签
+      let thinkStartSent = false     // 是否已发送思考开始标签
+      let isFirstAnswerChunk = true  // 是否是答案阶段的第一个块
       
-      // 用于SSE响应头
+      // 设置响应头
       response.on('start', () => {
         setResHeader(true)
       })
 
       // 辅助函数：发送SSE消息
-      const sendSSEChunk = (content) => {
+      const sendSSE = (content) => {
         if (!content || content.length === 0) return;
+        
+        console.log(`发送内容: "${content.substring(0, 30)}${content.length > 30 ? '...' : ''}" (长度: ${content.length})`)
         
         const streamTemplate = {
           "id": `chatcmpl-${id}`,
@@ -265,15 +267,14 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
           ]
         }
         res.write(`data: ${JSON.stringify(streamTemplate)}\n\n`)
-        completeContent += content
       }
 
-      // 处理收到的数据块
+      // 处理数据块
       response.on('data', async (chunk) => {
         const decodeText = decoder.decode(chunk, { stream: true })
-        console.log('原始SSE块:', decodeText)
+        console.log(`原始SSE块: ${decodeText.substring(0, 100)}${decodeText.length > 100 ? '...' : ''}`)
         
-        // 解析SSE消息
+        // 解析数据块
         const lists = decodeText.split('\n').filter(item => item.trim() !== '')
         for (const item of lists) {
           try {
@@ -293,184 +294,149 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
               webSearchInfo = decodeJson.choices[0].delta.extra.web_search_info
             }
 
-            // 提取阶段信息和内容
+            // 获取phase和status - 关键部分
             const phase = decodeJson.choices[0].delta.phase || ''
             const status = decodeJson.choices[0].delta.status || ''
             let content = decodeJson.choices[0].delta.content || ''
             
             console.log(`处理SSE块: Phase=${phase}, Status=${status}, Content长度=${content.length}`)
             
-            // 检测阶段变化
-            if (phase && phase !== previousPhase) {
-              console.log(`阶段转换: ${previousPhase || 'null'} -> ${phase}`)
+            // 检测phase变化 - 关键部分
+            if (phase && phase !== currentPhase) {
               previousPhase = currentPhase
               currentPhase = phase
-              phaseJustChanged = true
+              console.log(`阶段转换: ${previousPhase || 'null'} -> ${phase}`)
               
               // 处理从think到answer的转换
               if (previousPhase === 'think' && currentPhase === 'answer') {
-                if (!hasFinishedThinking) {
-                  // 强制插入</think>结束标签
-                  console.log('阶段转换: 强制插入思考结束标签')
-                  sendSSEChunk("</think>")
-                  hasFinishedThinking = true
+                console.log(`思考阶段结束，收集到的完整思考内容长度: ${completeThinkContent.length}`)
+                
+                // 如果未发送思考结束标签，发送它
+                if (!thinkEndSent && thinkStartSent) {
+                  sendSSE("</think>")
+                  thinkEndSent = true
                 }
+                
+                isFirstAnswerChunk = true
                 isInThinkingPhase = false
               }
-              
-              // 处理从无到think的转换
-              if (currentPhase === 'think' && !isInThinkingPhase) {
+              // 处理进入think阶段
+              else if (currentPhase === 'think') {
                 isInThinkingPhase = true
-                // 思考开始标签应该由首个内容块处理
               }
             }
             
             // 处理思考结束信号
             if (phase === 'think' && status === 'finished') {
               console.log('检测到思考阶段结束信号')
-              if (isInThinkingPhase && !hasFinishedThinking) {
-                sendSSEChunk("</think>")
-                hasFinishedThinking = true
+              
+              // 如果未发送思考结束标签，发送它
+              if (!thinkEndSent && thinkStartSent) {
+                sendSSE("</think>")
+                thinkEndSent = true
               }
-              continue; // 跳过空消息
+              
+              isInThinkingPhase = false
+              continue  // 跳过空内容
             }
             
-            // 确定真正的增量内容
-            if (content) {
-              // 计算新内容
-              let newContent = "";
+            // 没有内容则跳过
+            if (!content || content.length === 0) continue
+            
+            // 处理思考阶段内容 - 关键部分
+            if (isInThinkingPhase) {
+              // 收集思考内容
+              completeThinkContent += content
               
-              // 第一个think消息需要添加<think>标签
-              if (currentPhase === 'think' && thinkContent === "" && content) {
-                newContent = "<think>" + content;
-                thinkContent += content;
-              }
-              // 检测是否是answer阶段的第一条消息（通常包含完整think内容）
-              else if (currentPhase === 'answer' && phaseJustChanged && content.length > 0) {
-                console.log("检测到answer阶段第一条消息，执行去重...");
-                
-                // 从全量内容中移除已知的思考内容
-                if (thinkContent && content.includes(thinkContent)) {
-                  // 找到思考内容在全量回答中的位置
-                  const thinkPos = content.indexOf(thinkContent);
-                  // 仅保留思考内容之后的部分作为真正新内容
-                  newContent = content.substring(thinkPos + thinkContent.length);
-                  console.log(`已移除重复的思考内容，提取的新内容长度：${newContent.length}`);
-                } else {
-                  // 如果无法精确匹配，使用完全去重算法
-                  newContent = getUniquePart(content, completeContent);
-                  console.log(`使用完全去重算法，提取的新内容长度：${newContent.length}`);
-                }
-                phaseJustChanged = false;
-              }
-              // 一般情况：增量更新
-              else {
-                // 检测重复内容，只保留新部分
-                newContent = getUniquePart(content, completeContent);
-                
-                // 如果是思考阶段，更新累积的思考内容
-                if (currentPhase === 'think') {
-                  thinkContent += newContent;
-                }
+              // 第一个思考块需要添加标签
+              if (!thinkStartSent) {
+                content = "<think>" + content
+                thinkStartSent = true
               }
               
-              // 处理思考内容的显示/隐藏逻辑
-              if (thinkingEnabled && process.env.OUTPUT_THINK === "false" && isInThinkingPhase) {
-                // 不显示思考内容，但仍然跟踪它
-                continue;
-              }
-              
-              // 发送真正的增量内容
-              if (newContent.length > 0) {
-                sendSSEChunk(newContent);
+              // 如果不显示思考，则不发送
+              if (thinkingEnabled && process.env.OUTPUT_THINK === "false") {
+                continue
               }
             }
+            // 处理回答阶段内容 - 关键部分
+            else if (currentPhase === 'answer') {
+              // 关键逻辑：处理回答阶段的第一个消息
+              if (isFirstAnswerChunk) {
+                console.log(`处理首个回答块，内容长度: ${content.length}`)
+                
+                // 检查内容是否包含完整的思考内容
+                if (completeThinkContent && completeThinkContent.length > 0) {
+                  if (content.includes(completeThinkContent)) {
+                    // 找到思考内容在全量回答中的位置
+                    const index = content.indexOf(completeThinkContent)
+                    
+                    // 如果思考内容在开头，则直接截取后面部分
+                    if (index === 0) {
+                      content = content.substring(completeThinkContent.length)
+                    }
+                    // 如果思考内容在中间某处，可能是全量模式，分析情况
+                    else {
+                      // 尝试查找完整的<think>内容</think>位置
+                      const thinkTagStart = content.indexOf("<think>")
+                      const thinkTagEnd = content.indexOf("</think>")
+                      
+                      if (thinkTagStart >= 0 && thinkTagEnd > thinkTagStart) {
+                        // 有完整思考标签，提取标签后的内容
+                        content = content.substring(thinkTagEnd + 8) // 8是</think>的长度
+                      } else {
+                        // 没有完整标签，但有思考内容，直接跳过思考内容
+                        content = content.substring(index + completeThinkContent.length)
+                      }
+                    }
+                    
+                    console.log(`移除完整思考内容后，剩余内容长度: ${content.length}`)
+                  }
+                  // 即使没有精确匹配，也尝试查找部分匹配
+                  else {
+                    // 寻找思考内容的后半部分是否在answer内容开头
+                    for (let i = Math.floor(completeThinkContent.length / 2); i > 10; i--) {
+                      const thinkEnd = completeThinkContent.substring(completeThinkContent.length - i)
+                      if (content.startsWith(thinkEnd)) {
+                        content = content.substring(i)
+                        console.log(`通过部分匹配移除重叠内容，剩余长度: ${content.length}`)
+                        break
+                      }
+                    }
+                  }
+                }
+                
+                isFirstAnswerChunk = false
+              }
+            }
+            
+            // 发送实际内容
+            if (content && content.length > 0) {
+              sendSSE(content)
+            }
+            
           } catch (error) {
-            console.log('处理SSE块时出错:', error)
-            console.error(error);
+            console.error('处理SSE块时出错:', error)
           }
         }
-      });
+      })
 
-      // 流结束处理
+      // 处理流结束
       response.on('end', async () => {
+        // 处理搜索信息
         if (process.env.OUTPUT_THINK === "false" && webSearchInfo) {
-          const webSearchTable = await accountManager.generateMarkdownTable(webSearchInfo, 
-                                                    process.env.SEARCH_INFO_MODE || "table")
-          sendSSEChunk(`\n\n\n${webSearchTable}`);
+          const webSearchTable = await accountManager.generateMarkdownTable(webSearchInfo, process.env.SEARCH_INFO_MODE || "table")
+          sendSSE(`\n\n\n${webSearchTable}`)
         }
+        
         console.log('SSE响应结束')
         res.write(`data: [DONE]\n\n`)
         res.end()
-      });
+      })
     } catch (error) {
-      console.log('streamResponseQwen3函数出错:', error)
+      console.error('streamResponseQwen3函数出错:', error)
       res.status(500).json({ error: "服务错误!!!" })
     }
-  };
-
-  // 辅助函数：获取内容的真正新部分
-  function getUniquePart(newContent, existingContent) {
-    // 如果完全相同，则没有新内容
-    if (newContent === existingContent) {
-      return "";
-    }
-    
-    // 如果新内容完全在已有内容中
-    if (existingContent.includes(newContent)) {
-      return "";
-    }
-    
-    // 如果新内容包含已有内容（全量更新情况）
-    if (newContent.includes(existingContent) && existingContent.length > 0) {
-      return newContent.substring(existingContent.length);
-    }
-    
-    // 寻找重叠部分
-    // 两种重叠：1. 已有内容结尾与新内容开头重叠
-    //         2. 新内容某个部分与已有内容完全匹配
-    
-    // 方法1：查找最大后缀-前缀重叠
-    let maxOverlap = 0;
-    if (existingContent.length > 0) {
-      // 查找已有内容的后缀与新内容的前缀的最大重叠
-      for (let i = 1; i <= Math.min(existingContent.length, newContent.length); i++) {
-        if (existingContent.endsWith(newContent.substring(0, i))) {
-          maxOverlap = i;
-        }
-      }
-    }
-    
-    // 如果找到重叠，只保留新内容中未重叠的部分
-    if (maxOverlap > 0) {
-      return newContent.substring(maxOverlap);
-    }
-    
-    // 方法2：查找子串匹配
-    // 在新内容中找到与已有内容最长的匹配部分
-    let maxMatchLength = 0;
-    let matchEndPos = -1;
-    
-    // 只有当已有内容与新内容都较长时才进行这个计算
-    if (existingContent.length > 5 && newContent.length > existingContent.length) {
-      for (let i = 0; i < newContent.length - 5; i++) {
-        for (let length = 5; length <= Math.min(existingContent.length, newContent.length - i); length++) {
-          const substr = newContent.substring(i, i + length);
-          if (existingContent.includes(substr) && length > maxMatchLength) {
-            maxMatchLength = length;
-            matchEndPos = i + length;
-          }
-        }
-      }
-    }
-    
-    // 如果找到大块匹配，只保留匹配后的内容
-    if (maxMatchLength > 5 && matchEndPos > 0) {
-      return newContent.substring(matchEndPos);
-    }
-    
-    // 如果以上都不适用，返回整个新内容
-    return newContent;
   }
 
   // 结束
