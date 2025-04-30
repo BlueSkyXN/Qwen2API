@@ -36,8 +36,8 @@ class Account {
     this.currentIndex = 0
     this.models = [
       "qwen-max-latest",
-      "qwen-plus-latest",
-      "qwen-turbo-latest",
+      "qwen-plus-2025-01-25",
+      "qwen-turbo-2025-02-11",
       "qwq-32b",
       "qvq-72b-preview-0310",
       "qwen2.5-omni-7b",
