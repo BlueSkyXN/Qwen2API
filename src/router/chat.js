@@ -240,7 +240,7 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
       let isInThinkingPhase = false  // 是否在思考阶段
       let thinkEndSent = false       // 是否已发送思考结束标签
       let thinkStartSent = false     // 是否已发送思考开始标签
-      let lastSentLength = 0         // 上次发送的内容长度
+      let sentChunks = []            // 记录已发送的所有内容块
       
       // 设置响应头
       response.on('start', () => {
@@ -269,9 +269,50 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
         }
         res.write(`data: ${JSON.stringify(streamTemplate)}\n\n`)
         
-        // 更新已发送内容
+        // 更新已发送内容 - 关键部分
         completeAnswerContent += content
-        lastSentLength = content.length
+        // 记录发送的内容块
+        sentChunks.push(content)
+      }
+
+      // 检查内容是否已发送
+      const isContentAlreadySent = (content) => {
+        // 直接完全匹配
+        if (completeAnswerContent === content || completeAnswerContent.includes(content)) {
+          return true;
+        }
+        
+        // 检查是否是已发送内容的延续
+        if (content.length > 10) {
+          for (let i = 10; i < Math.min(content.length, completeAnswerContent.length); i++) {
+            const overlap = completeAnswerContent.substring(completeAnswerContent.length - i);
+            if (content.startsWith(overlap)) {
+              return true;
+            }
+          }
+        }
+        
+        // 检查当前内容是否是前几个块的组合
+        if (sentChunks.length >= 2) {
+          const lastChunk = sentChunks[sentChunks.length - 1];
+          const secondLastChunk = sentChunks[sentChunks.length - 2];
+          
+          // 检查是否是最后两个块的组合
+          if (lastChunk && secondLastChunk && 
+              (lastChunk + secondLastChunk).includes(content) || 
+              (secondLastChunk + lastChunk).includes(content)) {
+            return true;
+          }
+          
+          // 检查是否是已发送内容块的任意组合
+          if (content.length < 100) { // 限制长度以避免性能问题
+            const contentNormalized = content.replace(/\s+/g, ' ').trim();
+            const joined = sentChunks.join('').replace(/\s+/g, ' ').trim();
+            return joined.includes(contentNormalized);
+          }
+        }
+        
+        return false;
       }
 
       // 提取真正的增量内容
@@ -280,9 +321,15 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
         if (!newContent || newContent.length === 0) return "";
         if (completeAnswerContent.length === 0) return newContent;
         
+        // 检查是否已发送
+        if (isContentAlreadySent(newContent)) {
+          console.log(`内容已发送，跳过: ${newContent.substring(0, 30)}...`);
+          return "";
+        }
+        
         // 策略1: 完全包含检测
         if (completeAnswerContent.includes(newContent)) {
-          console.log(`当前内容已完全包含在前序内容中，跳过`)
+          console.log(`当前内容已完全包含在前序内容中，跳过`);
           return "";
         }
         
@@ -296,7 +343,7 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
         // 策略3: 最大重叠检测 - 找出已发送内容结尾和新内容开头的最大重叠
         let maxOverlap = 0;
         // 限制检查长度，避免性能问题
-        const checkLength = Math.min(1000, completeAnswerContent.length);
+        const checkLength = Math.min(500, completeAnswerContent.length);
         const endPart = completeAnswerContent.substring(completeAnswerContent.length - checkLength);
         
         for (let i = Math.min(newContent.length, checkLength); i > 0; i--) {
@@ -308,14 +355,19 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
         
         if (maxOverlap > 0) {
           const incrementalPart = newContent.substring(maxOverlap);
-          console.log(`找到重叠内容(${maxOverlap}字符)，增量部分长度为 ${incrementalPart.length}`);
-          return incrementalPart;
+          if (incrementalPart.length > 0) {
+            console.log(`找到重叠内容(${maxOverlap}字符)，增量部分长度为 ${incrementalPart.length}`);
+            return incrementalPart;
+          } else {
+            console.log(`完全重叠，无需发送`);
+            return "";
+          }
         }
         
         // 策略4: 模糊匹配 - 分词并查找共同部分
-        if (newContent.length > 50 && completeAnswerContent.length > 100) {
+        if (newContent.length > 50 && completeAnswerContent.length > 50) {
           // 取新内容的前50个字符在已发送内容中查找
-          const prefix = newContent.substring(0, 50);
+          const prefix = newContent.substring(0, Math.min(50, newContent.length));
           const position = completeAnswerContent.indexOf(prefix);
           
           if (position >= 0) {
@@ -331,35 +383,33 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
             }
             
             if (matchLength > 50) {
-              console.log(`模糊匹配: 找到${matchLength}字符的匹配，提取后续内容`);
-              return newContent.substring(matchLength);
+              if (matchLength >= newContent.length) {
+                console.log(`模糊匹配: 内容完全匹配，无需发送`);
+                return "";
+              } else {
+                console.log(`模糊匹配: 找到${matchLength}字符的匹配，提取后续内容`);
+                // 检查是否截断内容中包含...
+                const newPartContent = newContent.substring(matchLength);
+                if (newPartContent.trim() === "..." || 
+                    newPartContent.endsWith("...") || 
+                    newPartContent.length < 5) {
+                  console.log(`检测到截断内容，忽略`);
+                  return "";
+                }
+                return newPartContent;
+              }
             }
           }
         }
         
-        // 策略5: 内容相似度检测 - 处理极端情况
-        // 如果新内容与已发送内容非常相似(仅少量差异)但不完全匹配
-        if (newContent.length > completeAnswerContent.length * 0.9 && 
-            newContent.length < completeAnswerContent.length * 1.1) {
-          // 比较新旧内容的开头部分
-          const minLength = Math.min(newContent.length, completeAnswerContent.length);
-          let diffStart = 0;
-          
-          // 找出内容开始不同的位置
-          while (diffStart < minLength && 
-                newContent[diffStart] === completeAnswerContent[diffStart]) {
-            diffStart++;
-          }
-          
-          // 如果开头高度相似(90%以上相同)，可能是轻微变更的全量更新
-          if (diffStart > minLength * 0.9) {
-            console.log(`检测到高相似度内容，仅提取差异部分`);
-            return newContent.substring(diffStart);
-          }
+        // 处理截断内容
+        if (newContent.endsWith("...") && 
+            completeAnswerContent.includes(newContent.substring(0, newContent.length - 3))) {
+          console.log(`检测到截断内容，忽略`);
+          return "";
         }
         
         // 默认情况：无法识别增量模式，返回完整内容
-        // 这种情况下可能会有重复，但避免了内容丢失
         console.log(`无法确定增量内容，返回完整内容(可能有重复)`);
         return newContent;
       };
@@ -412,6 +462,9 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
                   thinkEndSent = true
                 }
                 
+                // 重置答案部分变量
+                completeAnswerContent = "";
+                sentChunks = [];
                 isInThinkingPhase = false
               }
               // 进入think阶段
