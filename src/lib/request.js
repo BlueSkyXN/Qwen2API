@@ -39,7 +39,6 @@ const sendChatRequest = async (model, messages, stream, authToken) => {
     if (model.startsWith('qwen3')) {
       messages[messages.length - 1].feature_config = {
         "thinking_enabled": thinkingEnabled,
-        "output_schema": "phase",
         "thinking_budget": 38912
       }
     } else {
