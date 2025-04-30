@@ -227,261 +227,345 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
   // 新增函数 - 专门处理Qwen3系列模型的思考输出
   const streamResponseQwen3 = async (response, thinkingEnabled) => {
     try {
-      const id = uuid.v4();
-      const decoder = new TextDecoder('utf-8');
-      let backContent = null;
-      let webSearchInfo = null;
-      let temp_content = '';
-      let thinkEnd = false;
+      const id = uuid.v4()
+      const decoder = new TextDecoder('utf-8')
+      let webSearchInfo = null
+      let temp_content = ''
       
-      // 用于处理phase标记的思考过程
-      let previousPhase = null;
-      let isInThinkingPhase = false;
-      let hasFinishedThinking = false;
+      // 跟踪变量
+      let completeThinkContent = ""  // 完整思考内容
+      let completeAnswerContent = "" // 已发送的回答内容
+      let previousPhase = null       // 前一阶段
+      let currentPhase = null        // 当前阶段 
+      let isInThinkingPhase = false  // 是否在思考阶段
+      let thinkEndSent = false       // 是否已发送思考结束标签
+      let thinkStartSent = false     // 是否已发送思考开始标签
+      let sentChunks = []            // 记录已发送的所有内容块
       
-      // 新增：存储完整思考内容和排除计数
-      let completeThinkingContent = '';
-      let excludedContentLength = 0;
-      
+      // 设置响应头
       response.on('start', () => {
-        setResHeader(true);
-      });
-  
-      response.on('data', async (chunk) => {
-        const decodeText = decoder.decode(chunk, { stream: true });
-        console.log('原始SSE块:', decodeText);
+        setResHeader(true)
+      })
+
+      // 发送SSE消息的辅助函数
+      const sendSSE = (content) => {
+        if (!content || content.length === 0) return;
         
-        const lists = decodeText.split('\n').filter(item => item.trim() !== '');
-        for (const item of lists) {
-          try {
-            let decodeJson = isJson(item.replace("data: ", '')) ? JSON.parse(item.replace("data: ", '')) : null;
-            if (decodeJson === null) {
-              temp_content += item;
-              decodeJson = isJson(temp_content.replace("data: ", '')) ? JSON.parse(temp_content.replace("data: ", '')) : null;
-              if (decodeJson === null) {
-                continue;
-              }
-              temp_content = '';
+        console.log(`发送内容: "${content.substring(0, 30)}${content.length > 30 ? '...' : ''}" (长度: ${content.length})`)
+        
+        const streamTemplate = {
+          "id": `chatcmpl-${id}`,
+          "object": "chat.completion.chunk",
+          "created": new Date().getTime(),
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": content
+              },
+              "finish_reason": null
             }
-  
-            // 处理web_search信息
-            if (decodeJson.choices[0].delta.name === 'web_search') {
-              webSearchInfo = decodeJson.choices[0].delta.extra.web_search_info;
+          ]
+        }
+        res.write(`data: ${JSON.stringify(streamTemplate)}\n\n`)
+        
+        // 更新已发送内容 - 关键部分
+        completeAnswerContent += content
+        // 记录发送的内容块
+        sentChunks.push(content)
+      }
+
+      // 检查内容是否已发送
+      const isContentAlreadySent = (content) => {
+        // 直接完全匹配
+        if (completeAnswerContent === content || completeAnswerContent.includes(content)) {
+          return true;
+        }
+        
+        // 检查是否是已发送内容的延续
+        if (content.length > 10) {
+          for (let i = 10; i < Math.min(content.length, completeAnswerContent.length); i++) {
+            const overlap = completeAnswerContent.substring(completeAnswerContent.length - i);
+            if (content.startsWith(overlap)) {
+              return true;
             }
-  
-            const phase = decodeJson.choices[0].delta.phase || '';
-            const status = decodeJson.choices[0].delta.status || '';
-            
-            // 处理内容
-            let content = decodeJson.choices[0].delta.content || '';
-            
-            console.log(`处理SSE块: Phase=${phase}, Status=${status}, Content长度=${content.length}`);
-            
-            // 累积思考内容
-            if (phase === 'think' && content) {
-              completeThinkingContent += content;
-            }
-            
-            // 处理思考完成标记
-            if (phase === 'think' && status === 'finished') {
-              console.log('检测到思考阶段结束信号: phase=think, status=finished');
-              
-              if (isInThinkingPhase && !hasFinishedThinking) {
-                const endThinkTemplate = {
-                  "id": `chatcmpl-${id}`,
-                  "object": "chat.completion.chunk",
-                  "created": new Date().getTime(),
-                  "choices": [
-                    {
-                      "index": 0,
-                      "delta": {
-                        "content": "</think>"
-                      },
-                      "finish_reason": null
-                    }
-                  ]
-                };
-                res.write(`data: ${JSON.stringify(endThinkTemplate)}\n\n`);
-                hasFinishedThinking = true;
-                thinkEnd = true;
-                
-                console.log('思考阶段结束，收集到的完整思考内容长度:', completeThinkingContent.length);
-              }
-              
-              backContent = null;
-              content = '';
-              continue;
-            }
-            
-            // 处理阶段转换
-            if (phase) {
-              if (previousPhase !== phase) {
-                console.log(`阶段转换: ${previousPhase || 'null'} -> ${phase}`);
-                
-                if (phase === 'think' && !isInThinkingPhase) {
-                  content = '<think>' + content;
-                  isInThinkingPhase = true;
-                } 
-                else if (previousPhase === 'think' && phase === 'answer') {
-                  if (isInThinkingPhase && !hasFinishedThinking) {
-                    console.log('检测到phase从think切换到answer，但无明确结束信号，插入结束标签');
-                    const endThinkTemplate = {
-                      "id": `chatcmpl-${id}`,
-                      "object": "chat.completion.chunk",
-                      "created": new Date().getTime(),
-                      "choices": [
-                        {
-                          "index": 0,
-                          "delta": {
-                            "content": "</think>"
-                          },
-                          "finish_reason": null
-                        }
-                      ]
-                    };
-                    res.write(`data: ${JSON.stringify(endThinkTemplate)}\n\n`);
-                    hasFinishedThinking = true;
-                    thinkEnd = true;
-                    console.log('思考阶段结束，收集到的完整思考内容长度:', completeThinkingContent.length);
-                  }
-                  
-                  isInThinkingPhase = false;
-                  excludedContentLength = 0;
-                  backContent = null;
-                }
-                
-                previousPhase = phase;
-              }
-            }
-  
-            // 关键改进：在answer阶段处理内容，移除思考内容
-            if (phase === 'answer' && content) {
-              // 1. 完全匹配检查
-              if (completeThinkingContent && content.includes(completeThinkingContent)) {
-                const oldLength = content.length;
-                content = content.replace(completeThinkingContent, '');
-                excludedContentLength += (oldLength - content.length);
-                console.log('检测到完整思考内容，已移除，排除长度:', excludedContentLength);
-              } 
-              // 2. 部分匹配检查
-              else if (completeThinkingContent) {
-                // 将思考内容分割成段落进行匹配
-                const thinkingParagraphs = completeThinkingContent.split('\n\n');
-                
-                for (const paragraph of thinkingParagraphs) {
-                  if (paragraph.trim() && content.includes(paragraph)) {
-                    const oldLength = content.length;
-                    content = content.replace(paragraph, '');
-                    excludedContentLength += (oldLength - content.length);
-                    console.log('移除思考段落，新排除长度:', excludedContentLength);
-                  }
-                }
-                
-                // 尝试匹配较长的句子
-                const thinkingSentences = completeThinkingContent.split(/[.。!！?？\n]+/).filter(s => s.trim().length > 20);
-                for (const sentence of thinkingSentences) {
-                  if (sentence.trim() && content.includes(sentence)) {
-                    const oldLength = content.length;
-                    content = content.replace(sentence, '');
-                    excludedContentLength += (oldLength - content.length);
-                  }
-                }
-              }
-              
-              // 3. 特征模式识别
-              if (content.length > 100 && (content.includes('好的，用户') || content.includes('首先，我需要'))) {
-                // 尝试找到真正的回答开始位置
-                const possibleStartPatterns = [
-                  '你好！', '您好！', '喵！', '嗨！', '哈喽！', '血色月光下'
-                ];
-                
-                for (const pattern of possibleStartPatterns) {
-                  const startIndex = content.indexOf(pattern);
-                  if (startIndex > 0) {  // 找到合适的起始点
-                    console.log(`模糊匹配: 找到"${pattern}"起始于位置${startIndex}, 移除前缀`);
-                    content = content.substring(startIndex);
-                    break;
-                  }
-                }
-              }
-              
-              // 计数排除的内容量，如果足够多则停止进一步检查
-              if (excludedContentLength >= completeThinkingContent.length * 0.9) {
-                console.log('已排除足够的思考内容, 停止进一步检查');
-                completeThinkingContent = '';  // 清空，不再检查
-              }
-            }
-  
-            // 处理重复内容
-            if (backContent !== null && content) {
-              if (content === backContent) {
-                // 完全相同的内容，跳过
-                continue;
-              } else if (content.startsWith(backContent)) {
-                // 前缀重复，只保留新部分
-                content = content.substring(backContent.length);
-              } else {
-                // 尝试更智能的替换，避免思考内容泄漏
-                const cleanedContent = content.replace(backContent, '');
-                if (cleanedContent.length < content.length * 0.9) {
-                  content = cleanedContent;  // 只有当替换有效时才应用
-                }
-              }
-            }
-            
-            // 更新上一个内容
-            if (content) {
-              backContent = decodeJson.choices[0].delta.content || '';
-            }
-  
-            // 处理思考内容的显示/隐藏逻辑
-            if (thinkingEnabled && process.env.OUTPUT_THINK === "false" && !thinkEnd) {
-              // 思考未结束且不显示思考内容时跳过
-              continue;
-            }
-  
-            // 处理搜索信息
-            if (webSearchInfo && process.env.OUTPUT_THINK === "true") {
-              // 原有代码保持不变
-            }
-  
-            // 确保有内容才发送
-            if (content) {
-              console.log(`发送内容: "${content}" (长度: ${content.length})`);
-              const StreamTemplate = {
-                "id": `chatcmpl-${id}`,
-                "object": "chat.completion.chunk",
-                "created": new Date().getTime(),
-                "choices": [
-                  {
-                    "index": 0,
-                    "delta": {
-                      "content": content
-                    },
-                    "finish_reason": null
-                  }
-                ]
-              };
-              res.write(`data: ${JSON.stringify(StreamTemplate)}\n\n`);
-            }
-          } catch (error) {
-            console.log('处理SSE块时出错:', error);
-            res.status(500).json({ error: "服务错误!!!" });
           }
         }
-      });
-  
+        
+        // 检查当前内容是否是前几个块的组合
+        if (sentChunks.length >= 2) {
+          const lastChunk = sentChunks[sentChunks.length - 1];
+          const secondLastChunk = sentChunks[sentChunks.length - 2];
+          
+          // 检查是否是最后两个块的组合
+          if (lastChunk && secondLastChunk && 
+              (lastChunk + secondLastChunk).includes(content) || 
+              (secondLastChunk + lastChunk).includes(content)) {
+            return true;
+          }
+          
+          // 检查是否是已发送内容块的任意组合
+          if (content.length < 100) { // 限制长度以避免性能问题
+            const contentNormalized = content.replace(/\s+/g, ' ').trim();
+            const joined = sentChunks.join('').replace(/\s+/g, ' ').trim();
+            return joined.includes(contentNormalized);
+          }
+        }
+        
+        return false;
+      }
+
+      // 提取真正的增量内容
+      const getIncrementalContent = (newContent) => {
+        // 无内容或已发送内容为空时，直接返回
+        if (!newContent || newContent.length === 0) return "";
+        if (completeAnswerContent.length === 0) return newContent;
+        
+        // 检查是否已发送
+        if (isContentAlreadySent(newContent)) {
+          console.log(`内容已发送，跳过: ${newContent.substring(0, 30)}...`);
+          return "";
+        }
+        
+        // 策略1: 完全包含检测
+        if (completeAnswerContent.includes(newContent)) {
+          console.log(`当前内容已完全包含在前序内容中，跳过`);
+          return "";
+        }
+        
+        // 策略2: 全量更新检测 - 新内容包含所有已发送内容
+        if (newContent.includes(completeAnswerContent)) {
+          const newPart = newContent.substring(completeAnswerContent.length);
+          console.log(`全量更新: 提取新增部分，长度为 ${newPart.length}`);
+          return newPart;
+        }
+        
+        // 策略3: 最大重叠检测 - 找出已发送内容结尾和新内容开头的最大重叠
+        let maxOverlap = 0;
+        // 限制检查长度，避免性能问题
+        const checkLength = Math.min(500, completeAnswerContent.length);
+        const endPart = completeAnswerContent.substring(completeAnswerContent.length - checkLength);
+        
+        for (let i = Math.min(newContent.length, checkLength); i > 0; i--) {
+          if (endPart.endsWith(newContent.substring(0, i))) {
+            maxOverlap = i;
+            break;
+          }
+        }
+        
+        if (maxOverlap > 0) {
+          const incrementalPart = newContent.substring(maxOverlap);
+          if (incrementalPart.length > 0) {
+            console.log(`找到重叠内容(${maxOverlap}字符)，增量部分长度为 ${incrementalPart.length}`);
+            return incrementalPart;
+          } else {
+            console.log(`完全重叠，无需发送`);
+            return "";
+          }
+        }
+        
+        // 策略4: 模糊匹配 - 分词并查找共同部分
+        if (newContent.length > 50 && completeAnswerContent.length > 50) {
+          // 取新内容的前50个字符在已发送内容中查找
+          const prefix = newContent.substring(0, Math.min(50, newContent.length));
+          const position = completeAnswerContent.indexOf(prefix);
+          
+          if (position >= 0) {
+            // 找到匹配，检查后续内容
+            const matchedPart = completeAnswerContent.substring(position);
+            let matchLength = 0;
+            
+            // 找出完全匹配的长度
+            while (matchLength < matchedPart.length && 
+                  matchLength < newContent.length && 
+                  matchedPart[matchLength] === newContent[matchLength]) {
+              matchLength++;
+            }
+            
+            if (matchLength > 50) {
+              if (matchLength >= newContent.length) {
+                console.log(`模糊匹配: 内容完全匹配，无需发送`);
+                return "";
+              } else {
+                console.log(`模糊匹配: 找到${matchLength}字符的匹配，提取后续内容`);
+                // 检查是否截断内容中包含...
+                const newPartContent = newContent.substring(matchLength);
+                if (newPartContent.trim() === "..." || 
+                    newPartContent.endsWith("...") || 
+                    newPartContent.length < 5) {
+                  console.log(`检测到截断内容，忽略`);
+                  return "";
+                }
+                return newPartContent;
+              }
+            }
+          }
+        }
+        
+        // 处理截断内容
+        if (newContent.endsWith("...") && 
+            completeAnswerContent.includes(newContent.substring(0, newContent.length - 3))) {
+          console.log(`检测到截断内容，忽略`);
+          return "";
+        }
+        
+        // 默认情况：无法识别增量模式，返回完整内容
+        console.log(`无法确定增量内容，返回完整内容(可能有重复)`);
+        return newContent;
+      };
+
+      // 处理数据块
+      response.on('data', async (chunk) => {
+        const decodeText = decoder.decode(chunk, { stream: true })
+        console.log(`原始SSE块: ${decodeText.substring(0, 100)}${decodeText.length > 100 ? '...' : ''}`)
+        
+        // 解析数据块
+        const lists = decodeText.split('\n').filter(item => item.trim() !== '')
+        for (const item of lists) {
+          try {
+            // 解析JSON
+            let decodeJson = isJson(item.replace("data: ", '')) ? JSON.parse(item.replace("data: ", '')) : null
+            if (decodeJson === null) {
+              temp_content += item
+              decodeJson = isJson(temp_content.replace("data: ", '')) ? JSON.parse(temp_content.replace("data: ", '')) : null
+              if (decodeJson === null) {
+                continue
+              }
+              temp_content = ''
+            }
+
+            // 处理 web_search 信息
+            if (decodeJson.choices[0].delta.name === 'web_search') {
+              webSearchInfo = decodeJson.choices[0].delta.extra.web_search_info
+            }
+
+            // 获取phase和status
+            const phase = decodeJson.choices[0].delta.phase || ''
+            const status = decodeJson.choices[0].delta.status || ''
+            let content = decodeJson.choices[0].delta.content || ''
+            
+            console.log(`处理SSE块: Phase=${phase}, Status=${status}, Content长度=${content.length}`)
+            
+            // 阶段变化检测
+            if (phase && phase !== currentPhase) {
+              previousPhase = currentPhase
+              currentPhase = phase
+              console.log(`阶段转换: ${previousPhase || 'null'} -> ${phase}`)
+              
+              // 从think转到answer
+              if (previousPhase === 'think' && currentPhase === 'answer') {
+                console.log(`思考阶段结束，收集到的完整思考内容长度: ${completeThinkContent.length}`)
+                
+                // 确保思考标签闭合
+                if (!thinkEndSent && thinkStartSent) {
+                  sendSSE("</think>")
+                  thinkEndSent = true
+                }
+                
+                // 重置答案部分变量
+                completeAnswerContent = "";
+                sentChunks = [];
+                isInThinkingPhase = false
+              }
+              // 进入think阶段
+              else if (currentPhase === 'think') {
+                isInThinkingPhase = true
+              }
+            }
+            
+            // 处理思考结束信号
+            if (phase === 'think' && status === 'finished') {
+              console.log('检测到思考阶段结束信号')
+              
+              // 确保思考标签闭合
+              if (!thinkEndSent && thinkStartSent) {
+                sendSSE("</think>")
+                thinkEndSent = true
+              }
+              
+              isInThinkingPhase = false
+              continue  // 跳过空内容
+            }
+            
+            // 没有内容则跳过
+            if (!content || content.length === 0) continue
+            
+            // 处理思考阶段内容
+            if (isInThinkingPhase || phase === 'think') {
+              // 收集思考内容
+              completeThinkContent += content
+              
+              // 第一个思考块需要添加标签
+              if (!thinkStartSent) {
+                content = "<think>" + content
+                thinkStartSent = true
+              }
+              
+              // 如果不显示思考，则不发送
+              if (thinkingEnabled && process.env.OUTPUT_THINK === "false") {
+                continue
+              }
+              
+              // 发送思考内容
+              sendSSE(content)
+            }
+            // 处理回答阶段内容
+            else if (currentPhase === 'answer' || phase === 'answer') {
+              // 处理第一个回答块 - 可能包含思考内容
+              if (completeThinkContent && completeThinkContent.length > 0 && completeAnswerContent.length === 0) {
+                console.log(`处理首个回答块，检查是否包含思考内容`);
+                
+                // 检查内容是否包含完整思考内容
+                if (content.includes(completeThinkContent)) {
+                  // 从内容中移除思考部分
+                  const thinkPos = content.indexOf(completeThinkContent);
+                  if (thinkPos >= 0) {
+                    // 移除思考内容及其前后的部分
+                    content = content.substring(thinkPos + completeThinkContent.length);
+                    console.log(`已移除思考内容，剩余长度: ${content.length}`);
+                    
+                    // 查找并移除可能的</think>标签
+                    const thinkEndPos = content.indexOf("</think>");
+                    if (thinkEndPos >= 0) {
+                      content = content.substring(thinkEndPos + 8); // 8是</think>的长度
+                      console.log(`已移除</think>标签，剩余长度: ${content.length}`);
+                    }
+                  }
+                }
+              }
+              
+              // 提取真正的增量内容
+              const incrementalContent = getIncrementalContent(content);
+              
+              // 只发送增量内容
+              if (incrementalContent && incrementalContent.length > 0) {
+                sendSSE(incrementalContent);
+              }
+            }
+            
+          } catch (error) {
+            console.error('处理SSE块时出错:', error)
+          }
+        }
+      })
+
+      // 处理流结束
       response.on('end', async () => {
-        // 原有代码保持不变
-        console.log('SSE响应结束');
-        res.write(`data: [DONE]\n\n`);
-        res.end();
-      });
+        // 处理搜索信息
+        if (process.env.OUTPUT_THINK === "false" && webSearchInfo) {
+          const webSearchTable = await accountManager.generateMarkdownTable(webSearchInfo, process.env.SEARCH_INFO_MODE || "table")
+          sendSSE(`\n\n\n${webSearchTable}`)
+        }
+        
+        console.log('SSE响应结束')
+        res.write(`data: [DONE]\n\n`)
+        res.end()
+      })
     } catch (error) {
-      console.log('streamResponseQwen3函数出错:', error);
-      res.status(500).json({ error: "服务错误!!!" });
+      console.error('streamResponseQwen3函数出错:', error)
+      res.status(500).json({ error: "服务错误!!!" })
     }
-  };
+  }
 
   // 结束
   try {
