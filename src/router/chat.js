@@ -225,235 +225,205 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
   }
 
   // 新增函数 - 专门处理Qwen3系列模型的思考输出
-  const streamResponseQwen3 = async (response, thinkingEnabled) => {
-    try {
-      const id = uuid.v4();
-      const decoder = new TextDecoder('utf-8');
-      let temp_content = ''; // 用于处理不完整的JSON块
 
-      // --- 状态变量 ---
-      let currentPhase = null;        // 当前阶段: 'think', 'answer', or null
-      let thinkStarted = false;       // 是否已发送 <think>
-      let thinkEnded = false;         // 是否已发送 </think>
-      let accumulatedThinkContent = ""; // 服务器端累积的完整思考内容
-      let lastSentAnswerContent = "";   // 服务器端记录的已发送给客户端的 *回答* 部分内容
-      // --- End 状态变量 ---
-
-      // 设置响应头
-      response.on('start', () => {
-        setResHeader(true);
-      });
-
-      // 发送SSE消息的辅助函数
-      const sendSSE = (content) => {
-        if (!content || content.length === 0) return;
-
-        // console.log(`发送内容: "${content.substring(0, 30)}${content.length > 30 ? '...' : ''}" (长度: ${content.length})`)
-
-        const streamTemplate = {
-          "id": `chatcmpl-${id}`,
-          "object": "chat.completion.chunk",
-          "created": new Date().getTime(),
-          "choices": [
-            {
-              "index": 0,
-              "delta": {
-                "content": content
-              },
-              "finish_reason": null
-            }
-          ]
+    // 函数：处理 Qwen3 流式输出，使用并行的 reasoning_content 和 content 字段
+    const streamResponseQwen3 = async (response, thinkingEnabled) => {
+      try {
+        const id = uuid.v4();
+        const decoder = new TextDecoder('utf-8');
+        let temp_content_buffer = ''; // 用于处理不完整的JSON行缓冲
+  
+        // --- 状态变量 ---
+        let currentPhase = null;        // 当前 Qwen 输出阶段: 'think', 'answer', 或 null
+        let accumulatedThinkContent = ""; // 服务器端累积的完整思考内容
+        let lastSentAnswerContent = "";   // 服务器端记录的、已发送给客户端的 *回答* 部分内容
+        // --- End 状态变量 ---
+  
+        response.on('start', () => {
+          setResHeader(true);
+        });
+  
+        // 发送 SSE 数据块的辅助函数
+        // type: 'reasoning_delta' -> 发送 reasoning_content
+        // type: 'content_delta'  -> 发送 content
+        const sendSSE = (deltaText, type = 'content_delta') => {
+          if (deltaText === null || deltaText === undefined || deltaText.length === 0) {
+            return;
+          }
+  
+          // 构建 delta 负载
+          const deltaPayload = {
+            role: "assistant"
+          };
+  
+          // *** 关键：根据类型填充不同的并行字段 ***
+          if (type === 'reasoning_delta') {
+            deltaPayload.reasoning_content = deltaText; // 填充 reasoning_content
+            // deltaPayload.content = null; // 可以显式设为 null 或省略
+          } else {
+            deltaPayload.content = deltaText; // 填充 content
+            // deltaPayload.reasoning_content = null; // 可以显式设为 null 或省略
+          }
+  
+          // 构建 SSE 消息体
+          const streamTemplate = {
+            "id": `chatcmpl-${id}`,
+            "object": "chat.completion.chunk",
+            "created": new Date().getTime(),
+            "choices": [
+              {
+                "index": 0,
+                "delta": deltaPayload, // delta 内部包含并行字段
+                "finish_reason": null
+              }
+            ]
+          };
+          // console.log(`发送 ${type} 块: ${JSON.stringify(streamTemplate)}`);
+          res.write(`data: ${JSON.stringify(streamTemplate)}\n\n`);
         };
-        res.write(`data: ${JSON.stringify(streamTemplate)}\n\n`);
-      };
-
-      // 处理数据块
-      response.on('data', async (chunk) => {
-        const decodeText = decoder.decode(chunk, { stream: true });
-        // console.log(`原始SSE块: ${decodeText.substring(0, 150)}${decodeText.length > 150 ? '...' : ''}`) // 增加log长度
-
-        const lines = decodeText.split('\n');
-        for (const line of lines) {
-          if (line.trim().startsWith('data:')) {
-            const jsonData = line.substring('data:'.length).trim();
-            if (!jsonData) continue;
-
-            try {
-              let decodeJson = JSON.parse(jsonData);
-
-              // 忽略非choices或空choices的块
-              if (!decodeJson.choices || decodeJson.choices.length === 0 || !decodeJson.choices[0].delta) {
-                  continue;
-              }
-
-              const delta = decodeJson.choices[0].delta;
-              const phase = delta.phase || currentPhase; // 继承上一阶段，如果当前块没有phase
-              const status = delta.status || '';
-              let content = delta.content || '';
-
-              // --- 核心逻辑 ---
-
-              // 1. 处理思考阶段 (phase === 'think')
-              if (phase === 'think') {
-                if (currentPhase !== 'think') {
-                    // 刚进入思考阶段 (虽然通常第一个块就是think，以防万一)
-                    currentPhase = 'think';
-                    console.log("阶段转换: -> think");
-                }
-
-                // 收到第一个思考内容时，发送 <think> 标签
-                if (!thinkStarted && content.length > 0) {
-                  // 只有当配置为输出思考时才发送
-                  if (thinkingEnabled && process.env.OUTPUT_THINK !== "false") {
-                      sendSSE("<think>");
-                  }
-                  thinkStarted = true;
-                }
-
-                // 累积思考内容
-                if (content.length > 0) {
-                    accumulatedThinkContent += content;
-                    // 将增量思考内容转发给客户端 (如果允许输出)
-                    if (thinkingEnabled && process.env.OUTPUT_THINK !== "false") {
-                        sendSSE(content);
-                    }
-                }
-
-                // 检查思考是否结束
-                if (status === 'finished') {
-                  console.log('检测到思考阶段结束信号 (think/finished)');
-                  if (thinkStarted && !thinkEnded) {
-                     // 只有当配置为输出思考时才发送
-                     if (thinkingEnabled && process.env.OUTPUT_THINK !== "false") {
-                        sendSSE("</think>");
-                     }
-                     thinkEnded = true;
-                  }
-                  // 注意：即使收到finished，下一个块可能还是think，也可能切换到answer
-                  // 所以 phase 的判断更重要
-                }
-              }
-              // 2. 处理回答阶段 (phase === 'answer')
-              else if (phase === 'answer') {
-                // 首次进入回答阶段
-                if (currentPhase !== 'answer') {
-                    console.log(`阶段转换: ${currentPhase || 'null'} -> answer`);
-                    currentPhase = 'answer';
-
-                    // 如果思考标签已开始但未结束，在此处结束它
-                    if (thinkStarted && !thinkEnded) {
-                        console.log('在进入answer阶段时结束思考标签');
-                        // 只有当配置为输出思考时才发送
-                        if (thinkingEnabled && process.env.OUTPUT_THINK !== "false") {
-                            sendSSE("</think>");
-                        }
-                        thinkEnded = true;
-                    }
-                }
-
-                // Qwen answer 阶段 content 是全量 (思考+回答)
-                const currentFullQwenContent = content;
-
-                // 如果思考内容为空，则整个内容都是回答
-                if (accumulatedThinkContent.length === 0) {
-                    const newAnswerDelta = currentFullQwenContent.substring(lastSentAnswerContent.length);
-                    if (newAnswerDelta.length > 0) {
-                        sendSSE(newAnswerDelta);
-                        lastSentAnswerContent = currentFullQwenContent; // 更新已发送的回答内容
-                    }
-                }
-                // 如果有思考内容，需要剥离
-                else {
-                    // 检查收到的全量内容是否确实以累积的思考内容开头
-                    if (currentFullQwenContent.startsWith(accumulatedThinkContent)) {
-                        const currentFullAnswerPart = currentFullQwenContent.substring(accumulatedThinkContent.length);
-                        const newAnswerDelta = currentFullAnswerPart.substring(lastSentAnswerContent.length);
-
-                        if (newAnswerDelta.length > 0) {
-                            sendSSE(newAnswerDelta);
-                            lastSentAnswerContent = currentFullAnswerPart; // 更新已发送的 *回答* 部分
-                        }
-                    } else {
-                        // 异常情况：收到的回答内容没有以预期的思考内容开头
-                        // 这可能是累积错误或Qwen行为变化。尝试直接发送增量（可能有风险）
-                        console.warn("警告: 回答块内容未以累积的思考内容开头。尝试直接差分。");
-                        console.warn("累积思考:", accumulatedThinkContent.slice(0, 50) + "...");
-                        console.warn("收到内容:", currentFullQwenContent.slice(0, 50) + "...");
-
-                        // 尝试基于上一次发送的回答内容进行差分（作为后备）
-                        const newAnswerDelta = currentFullQwenContent.substring(lastSentAnswerContent.length);
-                         if (newAnswerDelta.length > 0) {
-                            sendSSE(newAnswerDelta);
-                            lastSentAnswerContent = currentFullQwenContent; // 更新已发送的回答内容
-                        }
-                    }
-                }
-              }
-              // 3. 处理结束状态 (可能在 answer 阶段出现)
-              if (status === 'finished' && currentPhase === 'answer') {
-                  console.log('检测到回答阶段结束信号 (answer/finished)');
-                  // 通常这里 content 为空，主要标记流程结束
-              }
-
-              // 更新当前阶段状态，为下一个块做准备
-              if (phase) { // 只有当块明确指定了phase时才更新
-                  currentPhase = phase;
-              }
-
-            } catch (error) {
-              // 尝试处理拼接不完整的 JSON
-              temp_content += line;
+  
+        response.on('data', async (chunk) => {
+          const rawChunkText = decoder.decode(chunk, { stream: true });
+          temp_content_buffer += rawChunkText;
+  
+          let lines = temp_content_buffer.split('\n');
+          let completeLines = lines.slice(0, -1);
+          temp_content_buffer = lines[lines.length - 1];
+  
+          for (const line of completeLines) {
+            if (line.trim().startsWith('data:')) {
+              const jsonData = line.substring('data:'.length).trim();
+              if (!jsonData) continue;
+  
               try {
-                let decodeJson = JSON.parse(temp_content.replace("data: ", ''));
-                temp_content = ''; // 解析成功，清空 buffer
-
-                // ... 重新执行上面的解析和处理逻辑 ...
-                // (为简洁起见，此处省略重复代码，实际应用中需要提取成函数或复制逻辑)
-                 const delta = decodeJson.choices[0].delta;
-                 const phase = delta.phase || currentPhase;
-                 const status = delta.status || '';
-                 let content = delta.content || '';
-                 // ... [重复核心逻辑] ...
-                 // ... [重复核心逻辑] ...
-                 if (phase) { currentPhase = phase; }
-
-
-              } catch (parseError) {
-                // 如果仍然失败，说明 JSON 还不完整，继续等待下一个 chunk
-                // console.log('JSON 块不完整，等待拼接:', temp_content);
+                let decodeJson = JSON.parse(jsonData);
+  
+                if (!decodeJson.choices || decodeJson.choices.length === 0 || !decodeJson.choices[0].delta) {
+                  continue;
+                }
+  
+                const delta = decodeJson.choices[0].delta;
+                // 注意：这里我们仍然需要读取 Qwen 原始 delta 中的 'content' 字段
+                const qwenContent = delta.content;
+                const phase = delta.phase || currentPhase;
+                const status = delta.status || '';
+  
+                // --- 核心处理逻辑 ---
+                if (phase && phase !== currentPhase) {
+                  console.log(`阶段转换: ${currentPhase || 'null'} -> ${phase}`);
+                  currentPhase = phase;
+                }
+  
+                // 1. 处理思考阶段 ('think') -> 发送 reasoning_content
+                if (currentPhase === 'think') {
+                  // Qwen 的思考内容在 qwenContent 里
+                  if (qwenContent !== null && qwenContent !== undefined) {
+                      accumulatedThinkContent += qwenContent; // 累积思考内容
+                      // 如果允许输出，发送包含 reasoning_content 的块
+                      if (thinkingEnabled && process.env.OUTPUT_THINK !== "false") {
+                          sendSSE(qwenContent, 'reasoning_delta'); // *** 发送推理内容 ***
+                      }
+                  }
+                  if (status === 'finished') {
+                    console.log('检测到思考阶段结束信号 (think/finished)');
+                  }
+                }
+                // 2. 处理回答阶段 ('answer') -> 发送 content
+                else if (currentPhase === 'answer') {
+                   // Qwen 的回答内容（全量）也在 qwenContent 里
+                  if (qwenContent !== null && qwenContent !== undefined) {
+                      const currentFullQwenContent = qwenContent; // Qwen 的全量内容
+                      let newAnswerDelta = ""; // 本次要发送的 *回答* 增量
+  
+                      // *** 关键的差分逻辑，处理 Qwen 全量输出 ***
+                      if (accumulatedThinkContent.length === 0) {
+                          newAnswerDelta = currentFullQwenContent.substring(lastSentAnswerContent.length);
+                          if (newAnswerDelta.length > 0) {
+                             lastSentAnswerContent = currentFullQwenContent;
+                          }
+                      } else {
+                          if (currentFullQwenContent.startsWith(accumulatedThinkContent)) {
+                              const currentFullAnswerPart = currentFullQwenContent.substring(accumulatedThinkContent.length);
+                              newAnswerDelta = currentFullAnswerPart.substring(lastSentAnswerContent.length);
+                              if (newAnswerDelta.length > 0) {
+                                  lastSentAnswerContent = currentFullAnswerPart;
+                              }
+                          } else {
+                              console.warn("警告: 回答块内容未以累积的思考内容开头。");
+                              const potentialDelta = currentFullQwenContent.substring(lastSentAnswerContent.length);
+                              if(potentialDelta.length < currentFullQwenContent.length && potentialDelta.length > 0) {
+                                  console.warn("后备策略：基于 lastSentAnswerContent 进行差分。");
+                                  newAnswerDelta = potentialDelta;
+                                  lastSentAnswerContent = currentFullQwenContent;
+                              } else {
+                                  console.warn("后备策略失败，跳过发送。");
+                                  newAnswerDelta = "";
+                              }
+                          }
+                      }
+  
+                      // 发送计算出的回答增量（包含 content 字段）
+                      if (newAnswerDelta.length > 0) {
+                          sendSSE(newAnswerDelta, 'content_delta'); // *** 发送回答内容 ***
+                      }
+                  }
+                   if (status === 'finished') {
+                    console.log('检测到回答阶段结束信号 (answer/finished)');
+                   }
+                }
+              } catch (error) {
+                console.error('处理单个 SSE 行时出错:', line, error);
               }
             }
           }
-        }
-      });
-
-      // 处理流结束
-      response.on('end', async () => {
-        // 确保思考标签已关闭 (以防万一 Qwen 结束时没有明确的 finished 信号)
-        if (thinkStarted && !thinkEnded) {
-          console.log('在 SSE 流结束时强制关闭思考标签');
-           // 只有当配置为输出思考时才发送
-           if (thinkingEnabled && process.env.OUTPUT_THINK !== "false") {
-               sendSSE("</think>");
-           }
-           thinkEnded = true;
-        }
-        console.log('SSE响应结束');
-        res.write(`data: [DONE]\n\n`);
-        res.end();
-      });
-    } catch (error) {
-      console.error('streamResponseQwen3函数出错:', error);
-      // 确保在出错时也能结束响应
-      if (!res.writableEnded) {
-          try {
-              res.status(500).json({ error: "服务错误!!!" });
-          } catch (e) {
-              console.error("发送错误响应失败:", e);
+        });
+  
+        response.on('end', async () => {
+          if (temp_content_buffer.trim().startsWith('data:')) {
+             console.warn("Stream 结束时缓冲区仍有未处理数据:", temp_content_buffer);
           }
+          console.log('SSE 响应结束');
+          const finalChunk = {
+            "id": `chatcmpl-${id}`,
+            "object": "chat.completion.chunk",
+            "created": new Date().getTime(),
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+          };
+          res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+          res.write(`data: [DONE]\n\n`);
+          res.end();
+        });
+  
+        response.on('error', (err) => {
+            console.error('Qwen API 响应流错误:', err);
+            if (!res.writableEnded) {
+                try {
+                    const errorPayload = { error: { message: "与上游服务通信时出错", type: "upstream_error", code: err.code } };
+                     res.write(`data: ${JSON.stringify({
+                        "id": `chatcmpl-${id}`,
+                        "object": "chat.completion.chunk",
+                        "created": new Date().getTime(),
+                        "choices": [{ "index": 0, "delta": errorPayload, "finish_reason": "error" }]
+                     })}\n\n`);
+                     res.write(`data: [DONE]\n\n`);
+                     res.end();
+                } catch (e) {
+                    console.error("发送错误响应失败:", e);
+                    if (!res.writableEnded) res.end();
+                }
+            }
+        });
+  
+      } catch (error) {
+        console.error('streamResponseQwen3 函数设置出错:', error);
+        if (!res.headersSent && !res.writableEnded) {
+            res.status(500).json({ error: {message: "服务器内部错误", type: "internal_server_error"} });
+        } else if (!res.writableEnded) {
+            res.end();
+        }
       }
-    }
-  };
+    }; // end streamResponseQwen3
+    
   // 结束
   try {
     let response_data = null
