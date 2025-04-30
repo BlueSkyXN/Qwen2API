@@ -234,6 +234,7 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
       
       // 核心变量：用于收集思考内容
       let completeThinkContent = ""  // 收集完整的思考内容(不含标签)
+      let completeAnswerContent = "" // 收集完整的已发送回答内容
       let previousPhase = null       // 前一个阶段
       let currentPhase = null        // 当前阶段 
       let isInThinkingPhase = false  // 是否处于思考阶段
@@ -267,6 +268,11 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
           ]
         }
         res.write(`data: ${JSON.stringify(streamTemplate)}\n\n`)
+        
+        // 如果是回答阶段的内容，添加到已发送内容中
+        if (currentPhase === 'answer' && !isInThinkingPhase) {
+          completeAnswerContent += content
+        }
       }
 
       // 处理数据块
@@ -407,6 +413,41 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
                 }
                 
                 isFirstAnswerChunk = false
+              }
+              // 新增：处理后续回答块，确保只发送增量内容
+              else {
+                // 检查是否包含已发送的回答内容
+                if (completeAnswerContent && completeAnswerContent.length > 0) {
+                  // 情况1: 当前内容完全包含在已发送内容中
+                  if (completeAnswerContent.includes(content)) {
+                    console.log(`当前内容已完全包含在前序内容中，跳过`)
+                    continue;
+                  }
+                  
+                  // 情况2: 当前内容是全量模式，包含所有已发送内容
+                  if (content.includes(completeAnswerContent)) {
+                    content = content.substring(completeAnswerContent.length)
+                    console.log(`移除已发送内容，剩余长度: ${content.length}`)
+                  } 
+                  // 情况3: 与已发送内容存在部分重叠
+                  else {
+                    // 寻找最大重叠部分
+                    let maxOverlap = 0;
+                    const maxCheck = Math.min(content.length, completeAnswerContent.length);
+                    
+                    // 检查已发送内容的尾部与当前内容的头部的重叠
+                    for (let i = 1; i <= maxCheck; i++) {
+                      if (completeAnswerContent.endsWith(content.substring(0, i))) {
+                        maxOverlap = i;
+                      }
+                    }
+                    
+                    if (maxOverlap > 0) {
+                      content = content.substring(maxOverlap)
+                      console.log(`移除与已发送内容重叠部分，剩余长度: ${content.length}`)
+                    }
+                  }
+                }
               }
             }
             
