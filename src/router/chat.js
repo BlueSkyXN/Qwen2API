@@ -80,15 +80,9 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
 
 
   const notStreamResponse = async (response) => {
-    console.log('notStreamResponse 参数类型:', typeof response, response);
     setResHeader(false)
     try {
-      if (!response || !response.choices || !Array.isArray(response.choices) || !response.choices[0]) {
-        console.error('notStreamResponse: response.choices[0] 不存在', response);
-        res.status(500).json({ error: "上游响应格式错误" });
-        return;
-      }
-      console.log('notStreamResponse response:', JSON.stringify(response, null, 2));
+      console.log('notStreamResponse response:', JSON.stringify(response, null, 2)); // 新增响应体日志
       const bodyTemplate = {
         "id": `chatcmpl-${uuid.v4()}`,
         "object": "chat.completion",
@@ -99,15 +93,15 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
             "index": 0,
             "message": {
               "role": "assistant",
-              "content": response.choices[0].message ? response.choices[0].message.content : null
+              "content": response.choices && response.choices[0] && response.choices[0].message ? response.choices[0].message.content : null
             },
             "finish_reason": "stop"
           }
         ],
         "usage": {
           "prompt_tokens": JSON.stringify(req.body.messages).length,
-          "completion_tokens": response.choices[0].message ? response.choices[0].message.content.length : 0,
-          "total_tokens": JSON.stringify(req.body.messages).length + (response.choices[0].message ? response.choices[0].message.content.length : 0)
+          "completion_tokens": response.choices && response.choices[0] && response.choices[0].message ? response.choices[0].message.content.length : 0,
+          "total_tokens": JSON.stringify(req.body.messages).length + (response.choices && response.choices[0] && response.choices[0].message ? response.choices[0].message.content.length : 0)
         }
       }
       res.json(bodyTemplate)
@@ -469,9 +463,33 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
       }
 
     } else {
-      console.log('主流程 response_data:', JSON.stringify(response_data, null, 2));
-      console.log('主流程 response_data.response:', response_data ? JSON.stringify(response_data.response, null, 2) : response_data);
-      notStreamResponse(response_data.response)
+      if (req.body.model.includes('-draw')) {
+        const bodyTemplate = {
+          "id": `chatcmpl-${uuid.v4()}`,
+          "object": "chat.completion",
+          "created": new Date().getTime(),
+          "model": req.body.model,
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": `![${response_data.url}](${response_data.url})`
+              },
+              "finish_reason": "stop"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 1024,
+            "completion_tokens": 1024,
+            "total_tokens": 2048
+          }
+        }
+        setResHeader(stream)
+        res.json(bodyTemplate)
+      } else {
+        notStreamResponse(response_data.response)
+      }
     }
 
   } catch (error) {
