@@ -7,6 +7,9 @@ const { sendChatRequest } = require('../lib/request.js')
 const accountManager = require('../lib/account.js')
 const { createImageRequest, awaitImage } = require('../lib/image.js')
 
+// 获取 DEBUG 环境变量
+const DEBUG = process.env.DEBUG === "true"
+
 router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/completions`, async (req, res) => {
 
   // 身份验证
@@ -82,7 +85,7 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
   const notStreamResponse = async (response) => {
     setResHeader(false)
     try {
-      console.log('notStreamResponse response:', JSON.stringify(response, null, 2)); // 新增响应体日志
+      if (DEBUG) console.log('notStreamResponse response:', JSON.stringify(response, null, 2)); // 新增响应体日志
       const bodyTemplate = {
         "id": `chatcmpl-${uuid.v4()}`,
         "object": "chat.completion",
@@ -406,10 +409,10 @@ router.post(`${process.env.API_PREFIX ? process.env.API_PREFIX : ''}/v1/chat/com
     let response_data = null
     if (req.body.model.includes('-draw')) {
       response_data = await createImageRequest(req.body.messages[req.body.messages.length - 1].content, req.body.model, '1024*1024', authToken)
-      console.log('createImageRequest 返回:', JSON.stringify(response_data, null, 2)); // 新增日志
+      if (DEBUG) console.log('createImageRequest 返回:', JSON.stringify(response_data, null, 2)); // 新增日志
     } else {
       response_data = await sendChatRequest(req.body.model, messages, stream, authToken)
-      console.log('sendChatRequest 返回:', JSON.stringify(response_data, null, 2)); // 新增日志
+      if (DEBUG) console.log('sendChatRequest 返回:', JSON.stringify(response_data, null, 2)); // 新增日志
     }
 
     if (response_data.status === !200 || !response_data.response) {
